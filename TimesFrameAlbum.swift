@@ -176,6 +176,22 @@ struct AlbumAPI {
         }
     }
 
+    private func allPhotoIDs(albumID: Int) async throws -> Set<Int> {
+        var result = Set<Int>()
+        for page in 0..<100 {
+            let items = try await photos(albumID: albumID, start: page * 100 + 1)
+            result.formUnion(items.map(\.id))
+            if items.count < 100 { return result }
+        }
+        throw FrameError.message("相册照片过多，无法完成删除结果校验。")
+    }
+
+    private func batches(_ ids: [Int], size: Int = 10) -> [[Int]] {
+        stride(from: 0, to: ids.count, by: size).map {
+            Array(ids[$0..<min($0 + size, ids.count)])
+        }
+    }
+
     func mediaURL(_ path: String) -> URL? {
         guard path.hasPrefix("/userdata/"), !path.contains(".."), !path.contains("?") else { return nil }
         return URL(string: "http://\(ip):\(port)\(path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path)")
@@ -190,30 +206,55 @@ struct AlbumAPI {
 
     func remove(_ ids: [Int], from album: Album) async throws {
         guard album.canEdit, !ids.isEmpty else { throw FrameError.message("只能修改普通相册。") }
-        _ = try await command("Photo/RemovePhotoFromAlbum", fields: [
-            "ClockId": album.id, "ParentItemId": 0, "ParentClockId": 0, "PhotoList": ids
-        ])
+        for batch in batches(Array(Set(ids)).sorted()) {
+            _ = try await command("Photo/RemovePhotoFromAlbum", fields: [
+                "ClockId": album.id, "ParentItemId": 0, "ParentClockId": 0, "PhotoList": batch
+            ])
+        }
+        for _ in 0..<10 {
+            let remaining = Set(ids).intersection(try await allPhotoIDs(albumID: album.id))
+            if remaining.isEmpty { return }
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        throw FrameError.message("部分图片仍在相册中，请刷新列表核对后重试。")
     }
 
     func delete(_ ids: [Int], from album: Album) async throws {
         guard album.canEdit, !ids.isEmpty else { throw FrameError.message("只能从普通相册删除照片。") }
-        _ = try await command("Photo/DeletePhoto", fields: [
-            "ClockId": album.id, "ParentItemId": 0, "ParentClockId": 0, "PhotoList": ids
-        ])
+        let uniqueIDs = Array(Set(ids)).sorted()
+        for batch in batches(uniqueIDs) {
+            _ = try await command("Photo/DeletePhoto", fields: [
+                "ClockId": album.id, "ParentItemId": 0, "ParentClockId": 0, "PhotoList": batch
+            ])
+        }
+        let allAlbum = try await albums().first(where: { $0.type == 1 })
+        for _ in 0..<10 {
+            let selected = Set(uniqueIDs)
+            let inAlbum = selected.intersection(try await allPhotoIDs(albumID: album.id))
+            var inAll = Set<Int>()
+            if let allAlbum {
+                inAll = selected.intersection(try await allPhotoIDs(albumID: allAlbum.id))
+            }
+            if inAlbum.isEmpty && inAll.isEmpty { return }
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        throw FrameError.message("部分设备原图仍未删除，请刷新列表核对后重试。")
     }
 
     func addExisting(_ ids: [Int], to album: Album) async throws -> Int {
         guard album.canEdit, !ids.isEmpty else { throw FrameError.message("只能添加到普通相册。") }
         let existing = try await photos(albumID: album.id, start: 1)
         let existingIDs = Set(existing.map(\.id))
-        let newIDs = Array(Set(ids)).filter { !existingIDs.contains($0) }
+        let newIDs = Array(Set(ids)).filter { !existingIDs.contains($0) }.sorted()
         guard existing.count + newIDs.count <= Self.maxPhotosPerAlbum else {
             throw FrameError.message("每个相册最多 100 张图片；当前已有至少 \(existing.count) 张，无法再加入 \(newIDs.count) 张。")
         }
         guard !newIDs.isEmpty else { return 0 }
-        _ = try await command("Photo/DevicePhotoToAlbum", fields: [
-            "ToClockId": album.id, "ParentItemId": 0, "ParentClockId": 0, "PhotoList": newIDs
-        ])
+        for batch in batches(newIDs) {
+            _ = try await command("Photo/DevicePhotoToAlbum", fields: [
+                "ToClockId": album.id, "ParentItemId": 0, "ParentClockId": 0, "PhotoList": batch
+            ])
+        }
         let expected = Set(newIDs)
         for _ in 0..<10 {
             let current = Set(try await photos(albumID: album.id, start: 1).map(\.id))
@@ -462,6 +503,25 @@ enum PhotoEncoder {
         }
     }
 
+    func selectAllPhotos() {
+        guard let album = selectedAlbum else { return }
+        run {
+            let api = try self.api()
+            var loaded: [Photo] = []
+            var reachedEnd = false
+            for page in 0..<100 {
+                let next = try await api.photos(albumID: album.id, start: page * 100 + 1)
+                loaded += next
+                if next.count < 100 { reachedEnd = true; break }
+            }
+            guard reachedEnd else { throw FrameError.message("相册照片过多，无法全选。") }
+            self.photos = loaded
+            self.canLoadMore = false
+            self.selectedPhotoIDs = Set(loaded.map(\.id))
+            self.status = "已选中“\(album.name)”中的 \(self.selectedPhotoIDs.count) 张。"
+        }
+    }
+
     func importFiles(_ urls: [URL]) {
         guard let album = selectedAlbum, album.canEdit, !urls.isEmpty else { return }
         run {
@@ -589,6 +649,7 @@ private struct PhotoFramePreference: PreferenceKey {
 @MainActor private final class PhotoGridState: ObservableObject {
     @Published var frames: [Int: CGRect] = [:]
     @Published var marquee: CGRect?
+    var selectionBeforeDrag: Set<Int>?
     var suppressClickUntil = Date.distantPast
 }
 
@@ -627,6 +688,7 @@ struct SelectablePhotoGrid: View {
         .simultaneousGesture(
             DragGesture(minimumDistance: 6, coordinateSpace: .named("photoGrid"))
                 .onChanged { value in
+                    if state.selectionBeforeDrag == nil { state.selectionBeforeDrag = selectedIDs }
                     let rect = CGRect(
                         x: min(value.startLocation.x, value.location.x),
                         y: min(value.startLocation.y, value.location.y),
@@ -634,13 +696,15 @@ struct SelectablePhotoGrid: View {
                         height: abs(value.location.y - value.startLocation.y)
                     )
                     state.marquee = rect
-                    selectedIDs = Set(photos.compactMap { photo in
+                    let inside = Set(photos.compactMap { photo in
                         state.frames[photo.id]?.intersects(rect) == true ? photo.id : nil
                     })
+                    selectedIDs = state.selectionBeforeDrag!.union(inside)
                     state.suppressClickUntil = Date().addingTimeInterval(0.4)
                 }
                 .onEnded { _ in
                     state.marquee = nil
+                    state.selectionBeforeDrag = nil
                     state.suppressClickUntil = Date().addingTimeInterval(0.4)
                 }
         )
@@ -727,18 +791,28 @@ struct ContentView: View {
                                 .disabled(model.busy).padding()
                         }
                     }
-                    HStack(spacing: 10) {
-                        Text("已选 \(model.selectedPhotoIDs.count) 张").foregroundStyle(.secondary)
-                        Button("下载原图") { model.downloadSelected() }.disabled(model.busy || model.selectedPhotoIDs.count != 1)
-                        if model.selectedAlbum?.canEdit == true {
-                            Button("加入已有照片…") { model.prepareAdd() }
-                                .disabled(model.busy || model.photos.count >= AlbumAPI.maxPhotosPerAlbum)
-                            Button("移出相册") { model.removeSelected() }.disabled(model.busy || model.selectedPhotoIDs.isEmpty)
-                            Button("从设备删除") { model.showDelete = true }
-                                .disabled(model.busy || model.selectedPhotoIDs.isEmpty)
-                                .foregroundStyle(.red)
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 10) {
+                            Text("已选 \(model.selectedPhotoIDs.count) 张 · 再次框选可累加")
+                                .foregroundStyle(.secondary)
+                            Button("全选相册") { model.selectAllPhotos() }
+                                .disabled(model.photos.isEmpty || model.busy)
+                            Button("清空选择") { model.selectedPhotoIDs.removeAll() }
+                                .disabled(model.selectedPhotoIDs.isEmpty || model.busy)
+                            Spacer()
                         }
-                        Spacer()
+                        HStack(spacing: 10) {
+                            Button("下载原图") { model.downloadSelected() }.disabled(model.busy || model.selectedPhotoIDs.count != 1)
+                            if model.selectedAlbum?.canEdit == true {
+                                Button("加入已有照片…") { model.prepareAdd() }
+                                    .disabled(model.busy || model.photos.count >= AlbumAPI.maxPhotosPerAlbum)
+                                Button("移出相册") { model.removeSelected() }.disabled(model.busy || model.selectedPhotoIDs.isEmpty)
+                                Button("从设备删除") { model.showDelete = true }
+                                    .disabled(model.busy || model.selectedPhotoIDs.isEmpty)
+                                    .foregroundStyle(.red)
+                            }
+                            Spacer()
+                        }
                     }
                     .padding(12)
                 }
@@ -795,6 +869,11 @@ struct ContentView: View {
                     }
                 }
                 HStack {
+                    Button("全选已加载") {
+                        model.addSelected = Set(model.allPhotosForAdd.map(\.id))
+                    }.disabled(model.allPhotosForAdd.isEmpty || model.busy)
+                    Button("清空选择") { model.addSelected.removeAll() }
+                        .disabled(model.addSelected.isEmpty || model.busy)
                     Spacer()
                     Button("取消") { model.showAddSheet = false }
                     Button("加入 \(model.addSelected.count) 张") { model.addExisting() }

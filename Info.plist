@@ -6,8 +6,8 @@
   <key>CFBundleDisplayName</key><string>TimesFrame 相册管理</string>
   <key>CFBundleExecutable</key><string>TimesFrameAlbum</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>0.4.0</string>
-	<key>CFBundleVersion</key><string>4</string>
+	<key>CFBundleShortVersionString</key><string>0.4.1</string>
+	<key>CFBundleVersion</key><string>5</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSLocalNetworkUsageDescription</key><string>读取和管理同一局域网内的 Divoom Times Frame 相册。</string>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/><key>NSAllowsArbitraryLoads</key><true/></dict>
