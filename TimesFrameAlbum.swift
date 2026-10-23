@@ -33,6 +33,7 @@ enum FrameError: LocalizedError {
 }
 
 struct AlbumAPI {
+    static let maxPhotosPerAlbum = 100
     let ip: String
     let port: Int
 
@@ -201,41 +202,68 @@ struct AlbumAPI {
         ])
     }
 
-    func addExisting(_ ids: [Int], to album: Album) async throws {
+    func addExisting(_ ids: [Int], to album: Album) async throws -> Int {
         guard album.canEdit, !ids.isEmpty else { throw FrameError.message("只能添加到普通相册。") }
+        let existing = try await photos(albumID: album.id, start: 1)
+        let existingIDs = Set(existing.map(\.id))
+        let newIDs = Array(Set(ids)).filter { !existingIDs.contains($0) }
+        guard existing.count + newIDs.count <= Self.maxPhotosPerAlbum else {
+            throw FrameError.message("每个相册最多 100 张图片；当前已有至少 \(existing.count) 张，无法再加入 \(newIDs.count) 张。")
+        }
+        guard !newIDs.isEmpty else { return 0 }
         _ = try await command("Photo/DevicePhotoToAlbum", fields: [
-            "ToClockId": album.id, "ParentItemId": 0, "ParentClockId": 0, "PhotoList": ids
+            "ToClockId": album.id, "ParentItemId": 0, "ParentClockId": 0, "PhotoList": newIDs
         ])
+        let expected = Set(newIDs)
+        for _ in 0..<10 {
+            let current = Set(try await photos(albumID: album.id, start: 1).map(\.id))
+            if expected.isSubset(of: current) { return newIDs.count }
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        throw FrameError.message("相框已接收添加请求，但未在相册中看到全部图片。请刷新相册确认。")
     }
 
     func upload(_ url: URL, to album: Album) async throws {
-        guard album.canEdit else { throw FrameError.message("请先选择普通相册。") }
-        let image = try PhotoEncoder.encode(url)
+        try await upload([url], to: album)
+    }
+
+    func upload(_ urls: [URL], to album: Album,
+                progress: ((Int, Int, String) async -> Void)? = nil) async throws {
+        guard album.canEdit, !urls.isEmpty else { throw FrameError.message("请先选择普通相册和图片。") }
         let before = try await photos(albumID: album.id, start: 1)
+        guard before.count + urls.count <= Self.maxPhotosPerAlbum else {
+            throw FrameError.message("每个相册最多 100 张图片；当前已有至少 \(before.count) 张，本次选了 \(urls.count) 张。")
+        }
         let oldIDs = Set(before.map(\.id))
-        let timestamp = Int(Date().timeIntervalSince1970 * 1000)
+        let baseTime = Int(Date().timeIntervalSince1970 * 1000)
         let batchFlag = Int(Date().timeIntervalSince1970)
-        let filename = "mac-\(UUID().uuidString.prefix(16)).jpg"
-        let title = String(url.deletingPathExtension().lastPathComponent.prefix(100))
-        let metadata: [String: Any] = [
-            "Command": "Photo/LocalAddToAlbum", "ReturnCode": 0,
-            "ClockId": album.id, "ParentItemId": 0, "ParentClockId": 0,
-            "UserId": 0, "PhotoX": 0, "PhotoY": 0,
-            "PhotoWidth": image.width, "PhotoHeight": image.height,
-            "PhotoIndex": 0, "PhotoTotalCnt": 1, "PhotoFlag": batchFlag,
-            "SendTime": timestamp, "TakingTime": timestamp,
-            "FileName": filename, "PreviewFileName": "", "PhotoTitle": title
-        ]
-        let (body, type) = try multipart(metadata: metadata, filename: filename, image: image.data)
-        guard body.count <= 100 * 1024 * 1024 else { throw FrameError.message("图片超过当前固件的 100 MB 上传限制。") }
-        _ = try await post("upload", body: body, contentType: type, timeout: 90)
-        // The upload acknowledgement precedes the background database insertion.
-        for _ in 0..<12 {
+        for (index, url) in urls.enumerated() {
+            if let progress { await progress(index + 1, urls.count, url.lastPathComponent) }
+            let image = try PhotoEncoder.encode(url)
+            let filename = "mac-\(UUID().uuidString.prefix(16)).jpg"
+            let title = String(url.deletingPathExtension().lastPathComponent.prefix(100))
+            let metadata: [String: Any] = [
+                "Command": "Photo/LocalAddToAlbum", "ReturnCode": 0,
+                "ClockId": album.id, "ParentItemId": 0, "ParentClockId": 0,
+                "UserId": 0, "PhotoX": 0, "PhotoY": 0,
+                "PhotoWidth": image.width, "PhotoHeight": image.height,
+                "PhotoIndex": index, "PhotoTotalCnt": urls.count, "PhotoFlag": batchFlag,
+                "SendTime": baseTime + index, "TakingTime": baseTime + index,
+                "FileName": filename, "PreviewFileName": "", "PhotoTitle": title
+            ]
+            let (body, type) = try multipart(metadata: metadata, filename: filename, image: image.data)
+            guard body.count <= 100 * 1024 * 1024 else {
+                throw FrameError.message("图片超过当前固件的 100 MB 上传限制。")
+            }
+            _ = try await post("upload", body: body, contentType: type, timeout: 90)
+        }
+        // A batch is committed asynchronously after its final item reaches the device.
+        for _ in 0..<30 {
             try await Task.sleep(nanoseconds: 1_000_000_000)
             let current = try await photos(albumID: album.id, start: 1)
-            if current.contains(where: { !oldIDs.contains($0.id) }) { return }
+            if current.filter({ !oldIDs.contains($0.id) }).count >= urls.count { return }
         }
-        throw FrameError.message("相框已接收图片，但 12 秒内未在相册中看到新增记录。请刷新相册确认，避免重复上传。")
+        throw FrameError.message("相框已接收图片，但 30 秒内未在相册中看到全部新增记录。请刷新相册确认，避免重复上传。")
     }
 
     private func multipart(metadata: [String: Any], filename: String, image: Data) throws -> (Data, String) {
@@ -438,15 +466,18 @@ enum PhotoEncoder {
         guard let album = selectedAlbum, album.canEdit, !urls.isEmpty else { return }
         run {
             let api = try self.api()
-            var completed = 0
-            for url in urls {
-                self.status = "正在上传 \(completed + 1)/\(urls.count)：\(url.lastPathComponent)"
-                try await api.upload(url, to: album)
-                completed += 1
+            do {
+                try await api.upload(urls, to: album) { index, total, filename in
+                    await MainActor.run { self.status = "正在上传 \(index)/\(total)：\(filename)" }
+                }
+            } catch {
+                self.photos = (try? await api.photos(albumID: album.id, start: 1)) ?? self.photos
+                self.canLoadMore = self.photos.count == 100
+                throw error
             }
             self.photos = try await api.photos(albumID: album.id, start: 1)
             self.canLoadMore = self.photos.count == 100
-            self.status = "已上传 \(completed) 张到“\(album.name)”。"
+            self.status = "已上传 \(urls.count) 张到“\(album.name)”。"
         }
     }
 
@@ -498,9 +529,10 @@ enum PhotoEncoder {
         let ids = Array(addSelected)
         showAddSheet = false
         run {
-            try await self.api().addExisting(ids, to: album)
+            let added = try await self.api().addExisting(ids, to: album)
             self.photos = try await self.api().photos(albumID: album.id, start: 1)
-            self.status = "已将 \(ids.count) 张已有照片加入“\(album.name)”。"
+            self.canLoadMore = self.photos.count == 100
+            self.status = "已将 \(added) 张已有照片加入“\(album.name)”。"
         }
     }
 
@@ -547,9 +579,76 @@ struct PhotoTile: View {
     }
 }
 
+private struct PhotoFramePreference: PreferenceKey {
+    static var defaultValue: [Int: CGRect] = [:]
+    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+@MainActor private final class PhotoGridState: ObservableObject {
+    @Published var frames: [Int: CGRect] = [:]
+    @Published var marquee: CGRect?
+    var suppressClickUntil = Date.distantPast
+}
+
+struct SelectablePhotoGrid: View {
+    let photos: [Photo]
+    let mediaURL: (Photo) -> URL?
+    @Binding var selectedIDs: Set<Int>
+    @StateObject private var state = PhotoGridState()
+    private let columns = [GridItem(.adaptive(minimum: 142, maximum: 142), spacing: 12)]
+
+    var body: some View {
+        LazyVGrid(columns: columns, spacing: 12) {
+            ForEach(photos) { photo in
+                PhotoTile(photo: photo, url: mediaURL(photo), selected: selectedIDs.contains(photo.id)) {
+                    if Date() >= state.suppressClickUntil { selectedIDs = [photo.id] }
+                }
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(key: PhotoFramePreference.self,
+                        value: [photo.id: geometry.frame(in: .named("photoGrid"))])
+                })
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            if let marquee = state.marquee {
+                Rectangle()
+                    .fill(Color.accentColor.opacity(0.15))
+                    .overlay(Rectangle().stroke(Color.accentColor, lineWidth: 1))
+                    .frame(width: marquee.width, height: marquee.height)
+                    .offset(x: marquee.minX, y: marquee.minY)
+                    .allowsHitTesting(false)
+            }
+        }
+        .coordinateSpace(name: "photoGrid")
+        .contentShape(Rectangle())
+        .onPreferenceChange(PhotoFramePreference.self) { state.frames = $0 }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 6, coordinateSpace: .named("photoGrid"))
+                .onChanged { value in
+                    let rect = CGRect(
+                        x: min(value.startLocation.x, value.location.x),
+                        y: min(value.startLocation.y, value.location.y),
+                        width: abs(value.location.x - value.startLocation.x),
+                        height: abs(value.location.y - value.startLocation.y)
+                    )
+                    state.marquee = rect
+                    selectedIDs = Set(photos.compactMap { photo in
+                        state.frames[photo.id]?.intersects(rect) == true ? photo.id : nil
+                    })
+                    state.suppressClickUntil = Date().addingTimeInterval(0.4)
+                }
+                .onEnded { _ in
+                    state.marquee = nil
+                    state.suppressClickUntil = Date().addingTimeInterval(0.4)
+                }
+        )
+    }
+}
+
 struct ContentView: View {
     @StateObject private var model = AlbumModel()
-    private let columns = [GridItem(.adaptive(minimum: 142, maximum: 142), spacing: 12)]
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
@@ -574,9 +673,7 @@ struct ContentView: View {
                     HStack {
                         Text("相册").font(.headline)
                         Spacer()
-                        Button { model.albumNameInput = ""; model.showNewAlbum = true } label: {
-                            Image(systemName: "plus")
-                        }
+                        Button("新建") { model.albumNameInput = ""; model.showNewAlbum = true }
                         .help("新建相册")
                         .disabled(model.busy || model.albums.isEmpty)
                     }
@@ -608,22 +705,22 @@ struct ContentView: View {
                 VStack(spacing: 0) {
                     HStack(spacing: 10) {
                         Text(model.selectedAlbum?.name ?? "请选择相册").font(.headline)
+                        if model.selectedAlbum != nil {
+                            Text(model.photos.count >= AlbumAPI.maxPhotosPerAlbum
+                                 ? "已达 100 张上限" : "\(model.photos.count)/100 张")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         Spacer()
                         Button("刷新") { model.refresh() }.disabled(model.busy || model.selectedAlbum == nil)
                         Button("上传照片…") { model.showImporter = true }
-                            .disabled(model.busy || model.selectedAlbum?.canEdit != true)
+                            .disabled(model.busy || model.selectedAlbum?.canEdit != true || model.photos.count >= AlbumAPI.maxPhotosPerAlbum)
                     }
                     .padding(12)
                     Divider()
                     ScrollView {
-                        LazyVGrid(columns: columns, spacing: 12) {
-                            ForEach(model.photos) { photo in
-                                PhotoTile(photo: photo, url: try? model.apiURL(photo.thumbnailPath), selected: model.selectedPhotoIDs.contains(photo.id)) {
-                                    if model.selectedPhotoIDs.contains(photo.id) { model.selectedPhotoIDs.remove(photo.id) }
-                                    else { model.selectedPhotoIDs.insert(photo.id) }
-                                }
-                            }
-                        }
+                        SelectablePhotoGrid(photos: model.photos,
+                            mediaURL: { try? model.apiURL($0.thumbnailPath) },
+                            selectedIDs: $model.selectedPhotoIDs)
                         .padding(14)
                         if model.canLoadMore {
                             Button("加载更多") { model.loadMore() }
@@ -634,7 +731,8 @@ struct ContentView: View {
                         Text("已选 \(model.selectedPhotoIDs.count) 张").foregroundStyle(.secondary)
                         Button("下载原图") { model.downloadSelected() }.disabled(model.busy || model.selectedPhotoIDs.count != 1)
                         if model.selectedAlbum?.canEdit == true {
-                            Button("加入已有照片…") { model.prepareAdd() }.disabled(model.busy)
+                            Button("加入已有照片…") { model.prepareAdd() }
+                                .disabled(model.busy || model.photos.count >= AlbumAPI.maxPhotosPerAlbum)
                             Button("移出相册") { model.removeSelected() }.disabled(model.busy || model.selectedPhotoIDs.isEmpty)
                             Button("从设备删除") { model.showDelete = true }
                                 .disabled(model.busy || model.selectedPhotoIDs.isEmpty)
@@ -688,14 +786,9 @@ struct ContentView: View {
                 Text("从设备照片中选择；每次加载 100 张，加入时不会复制文件。")
                     .foregroundStyle(.secondary)
                 ScrollView {
-                    LazyVGrid(columns: columns, spacing: 10) {
-                        ForEach(model.allPhotosForAdd) { photo in
-                            PhotoTile(photo: photo, url: try? model.apiURL(photo.thumbnailPath), selected: model.addSelected.contains(photo.id)) {
-                                if model.addSelected.contains(photo.id) { model.addSelected.remove(photo.id) }
-                                else { model.addSelected.insert(photo.id) }
-                            }
-                        }
-                    }
+                    SelectablePhotoGrid(photos: model.allPhotosForAdd,
+                        mediaURL: { try? model.apiURL($0.thumbnailPath) },
+                        selectedIDs: $model.addSelected)
                     if model.canLoadMoreForAdd {
                         Button("加载更多") { model.loadMoreForAdd() }
                             .disabled(model.busy).padding()
