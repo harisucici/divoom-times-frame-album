@@ -1,4 +1,5 @@
 import AppKit
+import Photos
 import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
@@ -386,6 +387,7 @@ enum PhotoEncoder {
     @Published var busy = false
     @Published var status = "连接 Times Frame 后选择相册。"
     @Published var isError = false
+    @Published var showLibrary = false
     @Published var showImporter = false
     @Published var showDelete = false
     @Published var showAddSheet = false
@@ -524,21 +526,45 @@ enum PhotoEncoder {
 
     func importFiles(_ urls: [URL]) {
         guard let album = selectedAlbum, album.canEdit, !urls.isEmpty else { return }
+        run { try await self.uploadFiles(urls, to: album) }
+    }
+
+    func importLibraryPhotos(_ assets: [PHAsset]) {
+        guard !busy, let album = selectedAlbum, album.canEdit, !assets.isEmpty else { return }
+        showLibrary = false
         run {
-            let api = try self.api()
-            do {
-                try await api.upload(urls, to: album) { index, total, filename in
-                    await MainActor.run { self.status = "正在上传 \(index)/\(total)：\(filename)" }
-                }
-            } catch {
-                self.photos = (try? await api.photos(albumID: album.id, start: 1)) ?? self.photos
-                self.canLoadMore = self.photos.count == 100
-                throw error
+            // Recheck before downloading iCloud originals; upload also checks again before writing.
+            let existing = try await self.api().photos(albumID: album.id, start: 1)
+            guard existing.count + assets.count <= AlbumAPI.maxPhotosPerAlbum else {
+                throw FrameError.message("相册剩余容量不足，请刷新后重新选择。")
             }
-            self.photos = try await api.photos(albumID: album.id, start: 1)
-            self.canLoadMore = self.photos.count == 100
-            self.status = "已上传 \(urls.count) 张到“\(album.name)”。"
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("TimesFrame-Photos-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            var urls: [URL] = []
+            for (index, asset) in assets.enumerated() {
+                self.status = "正在读取 Mac 相册照片 \(index + 1)/\(assets.count)（iCloud 照片可能需要下载）…"
+                urls.append(try await MacPhotoLibrary.export(asset, to: directory, index: index))
+            }
+            try await self.uploadFiles(urls, to: album)
         }
+    }
+
+    private func uploadFiles(_ urls: [URL], to album: Album) async throws {
+        let api = try self.api()
+        do {
+            try await api.upload(urls, to: album) { index, total, filename in
+                await MainActor.run { self.status = "正在上传 \(index)/\(total)：\(filename)" }
+            }
+        } catch {
+            self.photos = (try? await api.photos(albumID: album.id, start: 1)) ?? self.photos
+            self.canLoadMore = self.photos.count == 100
+            throw error
+        }
+        self.photos = try await api.photos(albumID: album.id, start: 1)
+        self.canLoadMore = self.photos.count == 100
+        self.status = "已上传 \(urls.count) 张到“\(album.name)”。"
     }
 
     func removeSelected() {
@@ -657,14 +683,30 @@ struct SelectablePhotoGrid: View {
     let photos: [Photo]
     let mediaURL: (Photo) -> URL?
     @Binding var selectedIDs: Set<Int>
+
+    var body: some View {
+        MarqueePhotoGrid(items: photos, tile: { photo, selected, action in
+            PhotoTile(photo: photo, url: mediaURL(photo), selected: selected, action: action)
+        }, selectedIDs: $selectedIDs)
+    }
+}
+
+struct MarqueePhotoGrid<Item: Identifiable, Tile: View>: View where Item.ID == Int {
+    let items: [Item]
+    let tile: (Item, Bool, @escaping () -> Void) -> Tile
+    @Binding var selectedIDs: Set<Int>
     @StateObject private var state = PhotoGridState()
     private let columns = [GridItem(.adaptive(minimum: 142, maximum: 142), spacing: 12)]
 
     var body: some View {
         LazyVGrid(columns: columns, spacing: 12) {
-            ForEach(photos) { photo in
-                PhotoTile(photo: photo, url: mediaURL(photo), selected: selectedIDs.contains(photo.id)) {
-                    if Date() >= state.suppressClickUntil { selectedIDs = [photo.id] }
+            ForEach(items) { photo in
+                tile(photo, selectedIDs.contains(photo.id)) {
+                    guard Date() >= state.suppressClickUntil else { return }
+                    if (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags).contains(.command) {
+                        if selectedIDs.contains(photo.id) { selectedIDs.remove(photo.id) }
+                        else { selectedIDs.insert(photo.id) }
+                    } else { selectedIDs = [photo.id] }
                 }
                 .background(GeometryReader { geometry in
                     Color.clear.preference(key: PhotoFramePreference.self,
@@ -696,7 +738,7 @@ struct SelectablePhotoGrid: View {
                         height: abs(value.location.y - value.startLocation.y)
                     )
                     state.marquee = rect
-                    let inside = Set(photos.compactMap { photo in
+                    let inside = Set(items.compactMap { photo in
                         state.frames[photo.id]?.intersects(rect) == true ? photo.id : nil
                     })
                     selectedIDs = state.selectionBeforeDrag!.union(inside)
@@ -776,6 +818,8 @@ struct ContentView: View {
                         }
                         Spacer()
                         Button("刷新") { model.refresh() }.disabled(model.busy || model.selectedAlbum == nil)
+                        Button("从 Mac 相册…") { model.showLibrary = true }
+                            .disabled(model.busy || model.selectedAlbum?.canEdit != true || model.photos.count >= AlbumAPI.maxPhotosPerAlbum)
                         Button("上传照片…") { model.showImporter = true }
                             .disabled(model.busy || model.selectedAlbum?.canEdit != true || model.photos.count >= AlbumAPI.maxPhotosPerAlbum)
                     }
@@ -827,6 +871,12 @@ struct ContentView: View {
             .padding(10)
         }
         .frame(minWidth: 850, minHeight: 580)
+        .sheet(isPresented: $model.showLibrary) {
+            MacPhotoLibraryView(maxSelection: max(0, AlbumAPI.maxPhotosPerAlbum - model.photos.count),
+                                albumName: model.selectedAlbum?.name ?? "相册",
+                                cancel: { model.showLibrary = false },
+                                upload: { model.importLibraryPhotos($0) })
+        }
         .fileImporter(isPresented: $model.showImporter, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
             if case let .success(urls) = result { model.importFiles(urls) }
         }
@@ -889,8 +939,13 @@ extension AlbumModel {
     func apiURL(_ path: String) throws -> URL? { try api().mediaURL(path) }
 }
 
+final class TimesFrameAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+}
+
 #if !FRAME_TEST
 @main struct TimesFrameAlbumApp: App {
+    @NSApplicationDelegateAdaptor(TimesFrameAppDelegate.self) private var appDelegate
     var body: some Scene { WindowGroup { ContentView() } }
 }
 #endif
