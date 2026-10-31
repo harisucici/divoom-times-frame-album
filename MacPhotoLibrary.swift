@@ -49,7 +49,8 @@ struct LibraryAlbum: Identifiable {
     @Published var message = ""
     @Published var needsPermission = false
     private var result: PHFetchResult<PHAsset>?
-    var canLoadMore: Bool { assets.count < (result?.count ?? 0) }
+    private var folderAssets: [PHAsset]?
+    var canLoadMore: Bool { assets.count < (folderAssets?.count ?? result?.count ?? 0) }
     var selectedAssets: [PHAsset] {
         assets.filter { selectedIDs.contains($0.id) }.map(\.asset)
     }
@@ -104,14 +105,26 @@ struct LibraryAlbum: Identifiable {
         selectedIDs.removeAll()
         assets = []
         result = nil
-        if let folder = selectedAlbum, folder.children != nil {
-            message = folder.children?.isEmpty == true ? "这个文件夹为空。" : "展开左侧文件夹，选择其中的相册以浏览照片。"
-            return
-        }
+        folderAssets = nil
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
-        if let collection = selectedAlbum?.collection {
+        if let folder = selectedAlbum, folder.children != nil {
+            var unique: [String: PHAsset] = [:]
+            func collect(_ node: LibraryAlbum) {
+                if let collection = node.collection {
+                    PHAsset.fetchAssets(in: collection, options: options).enumerateObjects { asset, _, _ in
+                        unique[asset.localIdentifier] = asset
+                    }
+                }
+                node.children?.forEach(collect)
+            }
+            collect(folder)
+            folderAssets = unique.values.sorted {
+                if $0.creationDate == $1.creationDate { return $0.localIdentifier < $1.localIdentifier }
+                return ($0.creationDate ?? .distantPast) > ($1.creationDate ?? .distantPast)
+            }
+        } else if let collection = selectedAlbum?.collection {
             result = PHAsset.fetchAssets(in: collection, options: options)
         } else {
             result = PHAsset.fetchAssets(with: .image, options: options)
@@ -121,10 +134,13 @@ struct LibraryAlbum: Identifiable {
     }
 
     func loadMore() {
-        guard let result else { return }
-        let end = min(assets.count + 200, result.count)
+        let count = folderAssets?.count ?? result?.count ?? 0
+        let end = min(assets.count + 200, count)
         guard assets.count < end else { return }
-        assets += (assets.count..<end).map { LibraryAsset(id: $0, asset: result.object(at: $0)) }
+        assets += (assets.count..<end).compactMap { index in
+            guard let asset = folderAssets?[index] ?? result?.object(at: index) else { return nil }
+            return LibraryAsset(id: index, asset: asset)
+        }
     }
 
     // Request the current rendition so edits and orientation from Photos are preserved.
@@ -239,13 +255,16 @@ struct MacPhotoLibraryView: View {
 
 struct NativeLibraryEntry {
     let id: Int
-    let asset: PHAsset?
+    var asset: PHAsset? = nil
+    var remoteURL: URL? = nil
 }
 
 // AppKit owns the entire pointer sequence; image content cannot intercept a drag.
 struct NativeLibraryGrid: NSViewRepresentable {
     let entries: [NativeLibraryEntry]
     @Binding var selectedIDs: Set<Int>
+    var deleteSelection: (() -> Void)? = nil
+    @Environment(\.isEnabled) private var isEnabled
 
     func makeNSView(context: Context) -> LibraryScrollView {
         let scroll = LibraryScrollView()
@@ -257,7 +276,9 @@ struct NativeLibraryGrid: NSViewRepresentable {
 
     func updateNSView(_ scroll: LibraryScrollView, context: Context) {
         guard let canvas = scroll.documentView as? LibraryGridCanvas else { return }
-        canvas.entries = entries
+        canvas.updateEntries(entries)
+        canvas.isEnabled = isEnabled
+        canvas.deleteSelection = deleteSelection
         canvas.selection = selectedIDs
         canvas.selectionChanged = { selectedIDs = $0 }
         scroll.needsLayout = true
@@ -285,6 +306,16 @@ final class LibraryScrollView: NSScrollView {
 final class LibraryGridCanvas: NSView {
     var entries: [NativeLibraryEntry] = []
     var selection = Set<Int>()
+    var isEnabled = true
+    var deleteSelection: (() -> Void)?
+    private var remoteTasks: [URL: URLSessionDataTask] = [:]
+    func updateEntries(_ newEntries: [NativeLibraryEntry]) {
+        let urls = Set(newEntries.compactMap(\.remoteURL))
+        for url in Array(remoteTasks.keys) where !urls.contains(url) {
+            remoteTasks.removeValue(forKey: url)?.cancel()
+        }
+        entries = newEntries
+    }
     var selectionChanged: (Set<Int>) -> Void = { _ in }
     private let thumbnails = NSCache<NSString, NSImage>()
     private var requests: [String: PHImageRequestID] = [:]
@@ -325,6 +356,7 @@ final class LibraryGridCanvas: NSView {
         needsDisplay = true
     }
     override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
         window?.makeFirstResponder(self)
         origin = convert(event.locationInWindow, from: nil)
         beforeDrag = selection
@@ -358,12 +390,37 @@ final class LibraryGridCanvas: NSView {
         needsDisplay = true
     }
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53, origin != nil { origin = nil; marquee = nil; publish(beforeDrag) }
+        guard isEnabled else { return }
+        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "a" {
+            publish(Set(entries.map(\.id)))
+        } else if event.keyCode == 51 || event.keyCode == 117 {
+            if !selection.isEmpty { deleteSelection?() }
+        } else if event.keyCode == 53, origin != nil { origin = nil; marquee = nil; publish(beforeDrag) }
         else { super.keyDown(with: event) }
     }
     func cancelRequests() {
         for request in requests.values { PHImageManager.default().cancelImageRequest(request) }
         requests.removeAll()
+        remoteTasks.values.forEach { $0.cancel() }
+        remoteTasks.removeAll()
+    }
+    private func remoteThumbnail(_ url: URL) -> NSImage? {
+        let key = url.absoluteString as NSString
+        if let image = thumbnails.object(forKey: key) { return image }
+        guard remoteTasks[url] == nil, !failedThumbnails.contains(url.absoluteString) else { return nil }
+        thumbnails.countLimit = 400
+        let task = FrameNetwork.localSession.dataTask(with: url) { [weak self] data, response, _ in
+            DispatchQueue.main.async {
+                guard let self, self.remoteTasks.removeValue(forKey: url) != nil else { return }
+                if (response as? HTTPURLResponse)?.statusCode == 200,
+                   let data, let image = NSImage(data: data) { self.thumbnails.setObject(image, forKey: key) }
+                else { self.failedThumbnails.insert(url.absoluteString) }
+                self.needsDisplay = true
+            }
+        }
+        remoteTasks[url] = task
+        task.resume()
+        return nil
     }
     private func thumbnail(for asset: PHAsset) -> NSImage? {
         let key = asset.localIdentifier
@@ -398,7 +455,9 @@ final class LibraryGridCanvas: NSView {
             NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).addClip()
             NSColor.quaternaryLabelColor.setFill()
             rect.fill()
-            if let asset = entries[index].asset, let image = thumbnail(for: asset) {
+            let entry = entries[index]
+            let image = entry.asset.flatMap { thumbnail(for: $0) } ?? entry.remoteURL.flatMap { remoteThumbnail($0) }
+            if let image {
                 let size = image.size
                 let side = min(size.width, size.height)
                 let source = CGRect(x: (size.width - side) / 2, y: (size.height - side) / 2, width: side, height: side)

@@ -27,9 +27,46 @@ struct FoundDevice: Identifiable {
 
 enum FrameError: LocalizedError {
     case message(String)
+    case device(Int, String)
     var errorDescription: String? {
-        if case let .message(value) = self { return value }
-        return nil
+        switch self {
+        case .message(let value): return value
+        case .device(let code, let message): return "设备错误 \(code)：\(message)"
+        }
+    }
+}
+
+enum FrameNetwork {
+    static func configuration(waitForConnectivity: Bool = false, resourceTimeout: TimeInterval = 120) -> URLSessionConfiguration {
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        // LAN device requests go directly to the device. Cloud requests retain
+        // the system proxy settings in their own independent sessions.
+        config.connectionProxyDictionary = [:]
+        // macOS may initially deny a request while displaying its permission alert.
+        config.waitsForConnectivity = waitForConnectivity
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = resourceTimeout
+        return config
+    }
+    static let localSession = URLSession(configuration: configuration())
+    static let connectionSession = URLSession(configuration: configuration(waitForConnectivity: true, resourceTimeout: 25))
+
+    static func message(for error: Error, target: String) -> String {
+        let error = error as NSError
+        if error.domain == NSURLErrorDomain {
+            switch error.code {
+            case NSURLErrorNotConnectedToInternet, NSURLErrorDataNotAllowed:
+                return "无法访问相框 \(target)（网络错误 \(error.code)）。请在系统设置 → 隐私与安全性 → 本地网络中允许 TimesFrame，然后重试；若已允许，请检查同一局域网及 VPN／网络过滤。"
+            case NSURLErrorTimedOut:
+                return "连接相框 \(target) 超时（-1001）。首次连接请允许本地网络访问；若已允许，请检查相框 IP、端口和 Wi-Fi。"
+            case NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost:
+                return "无法连接相框 \(target)（\(error.code)）。请检查 IP／端口，并确认 Mac 与相框在同一局域网。"
+            default: break
+            }
+        }
+        return "无法连接相框 \(target)：\(error.localizedDescription)（\(error.domain) \(error.code)）"
     }
 }
 
@@ -37,8 +74,10 @@ struct AlbumAPI {
     static let maxPhotosPerAlbum = 100
     let ip: String
     let port: Int
+    let userID: Int
+    let session: URLSession
 
-    init(ip: String, port: Int = 9000) throws {
+    init(ip: String, port: Int = 9000, userID: Int = 0, session: URLSession = FrameNetwork.localSession) throws {
         let parts = ip.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 4,
               parts.allSatisfy({ part in
@@ -49,11 +88,13 @@ struct AlbumAPI {
         }
         self.ip = ip
         self.port = port
+        self.userID = userID
+        self.session = session
     }
 
     private var root: URL { URL(string: "http://\(ip):\(port)")! }
 
-    private func post(_ path: String, body: Data, contentType: String, timeout: TimeInterval = 20) async throws -> [String: Any] {
+    func post(_ path: String, body: Data, contentType: String, timeout: TimeInterval = 20) async throws -> [String: Any] {
         var request = URLRequest(url: root.appendingPathComponent(path))
         request.httpMethod = "POST"
         request.httpBody = body
@@ -62,8 +103,8 @@ struct AlbumAPI {
         request.setValue(String(body.count), forHTTPHeaderField: "Content-Length")
         let data: Data
         let response: URLResponse
-        do { (data, response) = try await URLSession.shared.data(for: request) }
-        catch { throw FrameError.message("无法连接相框：\(error.localizedDescription)") }
+        do { (data, response) = try await session.data(for: request) }
+        catch { throw FrameError.message(FrameNetwork.message(for: error, target: "\(ip):\(port)")) }
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             throw FrameError.message("相框返回 HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)。")
         }
@@ -72,12 +113,12 @@ struct AlbumAPI {
         }
         let code = (object["ReturnCode"] as? NSNumber)?.intValue ?? -1
         guard code == 0 else {
-            throw FrameError.message("设备错误 \(code)：\(object["ReturnMessage"] as? String ?? "未知原因")")
+            throw FrameError.device(code, object["ReturnMessage"] as? String ?? "未知原因")
         }
         return object
     }
 
-    private func command(_ name: String, fields: [String: Any] = [:]) async throws -> [String: Any] {
+    func command(_ name: String, fields: [String: Any] = [:]) async throws -> [String: Any] {
         var value = fields
         value["Command"] = name
         value["ReturnCode"] = 0
@@ -85,14 +126,18 @@ struct AlbumAPI {
         return try await post("divoom_api", body: body, contentType: "application/json; charset=utf-8")
     }
 
-    func check() async throws -> String {
+    func connectionState() async throws -> (hardware: [String: Any], albums: [Album]) {
         let hardware = try await command("Device/GetHardwareVersion")
         let code = (hardware["Hardware"] as? NSNumber)?.intValue ?? -1
         guard [510, 511, 512].contains(code) else {
             throw FrameError.message("检测到设备型号 \(code)，不是已支持的 Times Frame。")
         }
-        _ = try await command("Photo/GetLocalAlbumList")
-        let firmware = (hardware["Software"] as? NSNumber)?.intValue ?? 0
+        return (hardware, try await albums())
+    }
+
+    func check() async throws -> String {
+        let state = try await connectionState()
+        let firmware = (state.hardware["Software"] as? NSNumber)?.intValue ?? 0
         return "已连接 Times Frame · 固件 \(firmware)"
     }
 
@@ -200,7 +245,7 @@ struct AlbumAPI {
 
     func download(_ photo: Photo) async throws -> Data {
         guard let url = mediaURL(photo.originalPath) else { throw FrameError.message("相框返回的原图路径无效。") }
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await session.data(from: url)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw FrameError.message("原图下载失败。") }
         return data
     }
@@ -276,18 +321,32 @@ struct AlbumAPI {
         guard before.count + urls.count <= Self.maxPhotosPerAlbum else {
             throw FrameError.message("每个相册最多 100 张图片；当前已有至少 \(before.count) 张，本次选了 \(urls.count) 张。")
         }
+        // Prepare every image before sending the first batch item. A decoding failure must
+        // not leave the frame waiting for the rest of an incomplete batch.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("TimesFrame-Prepared-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var prepared: [(URL, Int, Int)] = []
+        for (index, url) in urls.enumerated() {
+            if let progress { await progress(index + 1, urls.count, "准备图片：\(url.lastPathComponent)") }
+            let image = try PhotoEncoder.encode(url)
+            let file = directory.appendingPathComponent("\(index).jpg")
+            try image.data.write(to: file)
+            prepared.append((file, image.width, image.height))
+        }
         let oldIDs = Set(before.map(\.id))
         let baseTime = Int(Date().timeIntervalSince1970 * 1000)
-        let batchFlag = Int(Date().timeIntervalSince1970)
+        let batchFlag = Int.random(in: 1...Int(Int32.max))
         for (index, url) in urls.enumerated() {
             if let progress { await progress(index + 1, urls.count, url.lastPathComponent) }
-            let image = try PhotoEncoder.encode(url)
+            let staged = prepared[index]
+            let image = (data: try Data(contentsOf: staged.0), width: staged.1, height: staged.2)
             let filename = "mac-\(UUID().uuidString.prefix(16)).jpg"
             let title = String(url.deletingPathExtension().lastPathComponent.prefix(100))
             let metadata: [String: Any] = [
                 "Command": "Photo/LocalAddToAlbum", "ReturnCode": 0,
                 "ClockId": album.id, "ParentItemId": 0, "ParentClockId": 0,
-                "UserId": 0, "PhotoX": 0, "PhotoY": 0,
+                "UserId": userID, "PhotoX": 0, "PhotoY": 0,
                 "PhotoWidth": image.width, "PhotoHeight": image.height,
                 "PhotoIndex": index, "PhotoTotalCnt": urls.count, "PhotoFlag": batchFlag,
                 "SendTime": baseTime + index, "TakingTime": baseTime + index,
@@ -349,28 +408,27 @@ enum PhotoEncoder {
     static func encode(_ url: URL) throws -> (data: Data, width: Int, height: Int) {
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
-        guard let source = NSImage(contentsOf: url), source.size.width > 0, source.size.height > 0 else {
-            throw FrameError.message("无法打开图片：\(url.lastPathComponent)")
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 2048,
+                kCGImageSourceShouldCacheImmediately: true
+              ] as CFDictionary) else {
+            throw FrameError.message("无法解码图片：\(url.lastPathComponent)。请确认原文件已下载，或导出为 JPEG 后重试。")
         }
-        let scale = min(1.0, 2048 / max(source.size.width, source.size.height))
-        let width = max(1, Int((source.size.width * scale).rounded()))
-        let height = max(1, Int((source.size.height * scale).rounded()))
-        guard let bitmap = NSBitmapImageRep(
-            bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
-            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
-            isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
-        ), let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
-            throw FrameError.message("无法转换图片。")
+        let width = image.width, height = image.height
+        guard let context = CGContext(data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
+            throw FrameError.message("无法转换图片：\(url.lastPathComponent)")
         }
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = context
-        NSColor.white.setFill()
-        NSRect(x: 0, y: 0, width: width, height: height).fill()
-        source.draw(in: NSRect(x: 0, y: 0, width: width, height: height), from: .zero, operation: .sourceOver, fraction: 1)
-        context.flushGraphics()
-        NSGraphicsContext.restoreGraphicsState()
-        guard let data = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.88]) else {
-            throw FrameError.message("无法编码 JPEG。")
+        context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let flattened = context.makeImage(),
+              let data = NSBitmapImageRep(cgImage: flattened).representation(using: .jpeg, properties: [.compressionFactor: 0.88]) else {
+            throw FrameError.message("无法编码 JPEG：\(url.lastPathComponent)")
         }
         return (data, width, height)
     }
@@ -379,6 +437,15 @@ enum PhotoEncoder {
 @MainActor final class AlbumModel: ObservableObject {
     @Published var ip = UserDefaults.standard.string(forKey: "albumFrameIP") ?? ""
     @Published var port = "9000"
+    @Published var showSettings = false
+    @Published var showWorkbench = false
+    @Published var deviceID: Int?
+    @Published var cloudClockIDs: Set<Int>?
+    @Published var syncMessage = "尚未核对手机端相册"
+    let account = AccountModel.shared
+    @Published private(set) var connectedIP = ""
+    @Published private(set) var connectedPort = 9000
+    private var connection: AlbumAPI?
     @Published var found: [FoundDevice] = []
     @Published var albums: [Album] = []
     @Published var selectedAlbumID: Int?
@@ -401,9 +468,13 @@ enum PhotoEncoder {
     @Published var canLoadMore = false
 
     var selectedAlbum: Album? { albums.first(where: { $0.id == selectedAlbumID }) }
-    private func api() throws -> AlbumAPI { try AlbumAPI(ip: ip.trimmingCharacters(in: .whitespacesAndNewlines), port: Int(port) ?? 0) }
+    private func api() throws -> AlbumAPI {
+        guard let connection else { throw FrameError.message("请先连接设备。") }
+        return connection
+    }
 
     private func run(_ work: @escaping () async throws -> Void) {
+        guard !busy else { return }
         busy = true
         isError = false
         Task {
@@ -422,21 +493,57 @@ enum PhotoEncoder {
     }
 
     func connect() {
+        guard !busy else { return }
+        let address = ip.trimmingCharacters(in: .whitespacesAndNewlines), port = Int(port) ?? 0
         run {
-            let api = try self.api()
-            self.status = "正在读取相册…"
-            let device = try await api.check()
-            self.albums = try await api.albums()
-            UserDefaults.standard.set(self.ip, forKey: "albumFrameIP")
-            self.selectedAlbumID = self.albums.first(where: { $0.canEdit })?.id ?? self.albums.first?.id
-            if let album = self.selectedAlbum { self.photos = try await api.photos(albumID: album.id, start: 1) }
-            self.canLoadMore = self.photos.count == 100
+            let userID = self.account.session?.userID ?? 0
+            let api = try AlbumAPI(ip: address, port: port, userID: userID, session: FrameNetwork.connectionSession)
+            self.status = "正在连接 \(address):\(port)… 首次使用请在系统提示中允许本地网络访问。"
+            let state = try await api.connectionState()
+            let hardware = state.hardware, albums = state.albums
+            // Commit only after the new local endpoint is known to be usable.
+            // The permission-wait session is bounded at 25s; media keeps its normal transfer budget.
+            self.connection = try AlbumAPI(ip: address, port: port, userID: userID)
+            self.connectedIP = address; self.connectedPort = port
+            self.albums = albums
+            self.deviceID = (hardware["DeviceId"] as? NSNumber)?.intValue
+            self.account.saveConnection(ip: address, port: String(port))
+            self.cloudClockIDs = nil
+            self.syncMessage = "手机端列表尚未核对，可在连接后点击核对。"
+            self.selectedAlbumID = albums.first(where: { $0.canEdit })?.id ?? albums.first?.id
             self.selectedPhotoIDs.removeAll()
-            self.status = "\(device) · \(self.albums.count) 个相册"
+            self.photos = []
+            self.canLoadMore = false
+            let firmware = (hardware["Software"] as? NSNumber)?.intValue ?? 0
+            let connected = "已连接 Times Frame · 固件 \(firmware) · \(address):\(port) · \(albums.count) 个相册"
+            do {
+                if let album = self.selectedAlbum { self.photos = try await api.photos(albumID: album.id, start: 1) }
+                self.canLoadMore = self.photos.count == 100
+                self.status = connected
+            } catch {
+                self.isError = true
+                self.status = connected + "；照片列表读取失败，可刷新重试：" + error.localizedDescription
+            }
+        }
+    }
+
+    func checkCloudAlbums() {
+        guard deviceID != nil else { return }
+        run {
+            self.status = "正在核对手机端列表；本地连接不依赖此查询。"
+            await self.updateCloudStatus()
+            self.status = self.syncMessage
+        }
+    }
+
+    func openNetworkSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork") {
+            NSWorkspace.shared.open(url)
         }
     }
 
     func select(_ album: Album) {
+        guard !busy else { return }
         selectedAlbumID = album.id
         photos = []
         selectedPhotoIDs.removeAll()
@@ -448,8 +555,63 @@ enum PhotoEncoder {
     }
 
     func refresh() {
-        guard let album = selectedAlbum else { return }
-        select(album)
+        run {
+            let api = try self.api()
+            self.albums = try await api.albums()
+            if !self.albums.contains(where: { $0.id == self.selectedAlbumID }) {
+                self.selectedAlbumID = self.albums.first?.id
+            }
+            if let album = self.selectedAlbum {
+                self.photos = try await api.photos(albumID: album.id, start: 1)
+            } else { self.photos = [] }
+            self.selectedPhotoIDs.formIntersection(self.photos.map(\.id))
+            self.canLoadMore = self.photos.count == 100
+            self.status = "已刷新设备本地相册。"
+        }
+    }
+
+    private func updateCloudStatus() async {
+        cloudClockIDs = nil
+        guard let deviceID else { return }
+        do {
+            let clocks = try await DivoomCloud.clocks(deviceID: deviceID, session: account.session)
+            cloudClockIDs = Set(clocks.map(\.id))
+            let localOnly = albums.filter { $0.canEdit && !(cloudClockIDs?.contains($0.id) ?? false) }.count
+            syncMessage = localOnly == 0 ? "已核对手机端列表" : "\(localOnly) 个相册仅在设备本地；手机端相册请在手机 App 创建后刷新。"
+        } catch { syncMessage = "无法核对手机端列表：\(error.localizedDescription)" }
+    }
+
+    func connectionForAccount() {
+        guard !busy else { return }
+        let connection = account.connection
+        ip = connection.ip; port = connection.port
+        self.connection = nil; connectedIP = ""; connectedPort = 9000
+        deviceID = nil; albums = []; photos = []; selectedAlbumID = nil
+        selectedPhotoIDs = []; cloudClockIDs = nil
+        status = "账号已切换，请连接设备。"
+    }
+
+    func importFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.prompt = "读取文件夹"
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        let access = directory.startAccessingSecurityScopedResource()
+        defer { if access { directory.stopAccessingSecurityScopedResource() } }
+        do {
+            guard let iterator = FileManager.default.enumerator(at: directory,
+                includingPropertiesForKeys: [.isRegularFileKey, .contentTypeKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
+                throw FrameError.message("无法读取文件夹。")
+            }
+            var urls: [URL] = []
+            for case let url as URL in iterator {
+                let values = try url.resourceValues(forKeys: [.isRegularFileKey, .contentTypeKey])
+                if values.isRegularFile == true, values.contentType?.conforms(to: .image) == true { urls.append(url) }
+            }
+            guard !urls.isEmpty else { throw FrameError.message("文件夹中没有可上传的图片。") }
+            importFiles(urls.sorted { $0.path < $1.path }, scopedDirectory: directory)
+        } catch { isError = true; status = error.localizedDescription }
     }
 
     func createAlbum() {
@@ -462,7 +624,8 @@ enum PhotoEncoder {
             self.photos = []
             self.canLoadMore = false
             self.selectedPhotoIDs.removeAll()
-            self.status = "已新建相册“\(created.name)”。"
+            await self.updateCloudStatus()
+            self.status = "已新建设备本地相册“\(created.name)”。手机端相册需在手机 App 创建后刷新。"
         }
     }
 
@@ -473,7 +636,7 @@ enum PhotoEncoder {
             let api = try self.api()
             try await api.renameAlbum(album, to: name)
             self.albums = try await api.albums()
-            self.status = "已将相册重命名为“\(name.trimmingCharacters(in: .whitespacesAndNewlines))”。"
+            self.status = "已在设备本地重命名为“\(name.trimmingCharacters(in: .whitespacesAndNewlines))”；手机云端名称不变。"
         }
     }
 
@@ -524,9 +687,14 @@ enum PhotoEncoder {
         }
     }
 
-    func importFiles(_ urls: [URL]) {
-        guard let album = selectedAlbum, album.canEdit, !urls.isEmpty else { return }
-        run { try await self.uploadFiles(urls, to: album) }
+    func importFiles(_ urls: [URL], scopedDirectory: URL? = nil) {
+        guard !busy, let album = selectedAlbum, album.canEdit, !urls.isEmpty else { return }
+        // Acquire scope before leaving the panel callback, retaining it through async work.
+        let accessible = (urls + [scopedDirectory].compactMap { $0 }).filter { $0.startAccessingSecurityScopedResource() }
+        run {
+            defer { accessible.forEach { $0.stopAccessingSecurityScopedResource() } }
+            try await self.uploadFiles(urls, to: album)
+        }
     }
 
     func importLibraryPhotos(_ assets: [PHAsset]) {
@@ -638,123 +806,21 @@ enum PhotoEncoder {
     }
 }
 
-struct PhotoTile: View {
-    let photo: Photo
-    let url: URL?
-    let selected: Bool
-    let action: () -> Void
-    var body: some View {
-        Button(action: action) {
-            ZStack(alignment: .bottomLeading) {
-                AsyncImage(url: url) { image in
-                    image.resizable().scaledToFill()
-                } placeholder: {
-                    Image(systemName: photo.mediaType == "video" ? "film" : "photo")
-                        .font(.system(size: 28)).foregroundStyle(.secondary)
-                }
-                .frame(width: 142, height: 142).clipped()
-                Text("#\(photo.id)")
-                    .font(.caption2).padding(4)
-                    .background(.black.opacity(0.55)).foregroundStyle(.white)
-            }
-            .frame(width: 142, height: 142)
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(selected ? Color.accentColor : .clear, lineWidth: 4))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-private struct PhotoFramePreference: PreferenceKey {
-    static var defaultValue: [Int: CGRect] = [:]
-    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
-@MainActor private final class PhotoGridState: ObservableObject {
-    @Published var frames: [Int: CGRect] = [:]
-    @Published var marquee: CGRect?
-    var selectionBeforeDrag: Set<Int>?
-    var suppressClickUntil = Date.distantPast
-}
-
 struct SelectablePhotoGrid: View {
     let photos: [Photo]
     let mediaURL: (Photo) -> URL?
     @Binding var selectedIDs: Set<Int>
+    var deleteSelection: (() -> Void)? = nil
 
     var body: some View {
-        MarqueePhotoGrid(items: photos, tile: { photo, selected, action in
-            PhotoTile(photo: photo, url: mediaURL(photo), selected: selected, action: action)
-        }, selectedIDs: $selectedIDs)
-    }
-}
-
-struct MarqueePhotoGrid<Item: Identifiable, Tile: View>: View where Item.ID == Int {
-    let items: [Item]
-    let tile: (Item, Bool, @escaping () -> Void) -> Tile
-    @Binding var selectedIDs: Set<Int>
-    @StateObject private var state = PhotoGridState()
-    private let columns = [GridItem(.adaptive(minimum: 142, maximum: 142), spacing: 12)]
-
-    var body: some View {
-        LazyVGrid(columns: columns, spacing: 12) {
-            ForEach(items) { photo in
-                tile(photo, selectedIDs.contains(photo.id)) {
-                    guard Date() >= state.suppressClickUntil else { return }
-                    if (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags).contains(.command) {
-                        if selectedIDs.contains(photo.id) { selectedIDs.remove(photo.id) }
-                        else { selectedIDs.insert(photo.id) }
-                    } else { selectedIDs = [photo.id] }
-                }
-                .background(GeometryReader { geometry in
-                    Color.clear.preference(key: PhotoFramePreference.self,
-                        value: [photo.id: geometry.frame(in: .named("photoGrid"))])
-                })
-            }
-        }
-        .overlay(alignment: .topLeading) {
-            if let marquee = state.marquee {
-                Rectangle()
-                    .fill(Color.accentColor.opacity(0.15))
-                    .overlay(Rectangle().stroke(Color.accentColor, lineWidth: 1))
-                    .frame(width: marquee.width, height: marquee.height)
-                    .offset(x: marquee.minX, y: marquee.minY)
-                    .allowsHitTesting(false)
-            }
-        }
-        .coordinateSpace(name: "photoGrid")
-        .contentShape(Rectangle())
-        .onPreferenceChange(PhotoFramePreference.self) { state.frames = $0 }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 6, coordinateSpace: .named("photoGrid"))
-                .onChanged { value in
-                    if state.selectionBeforeDrag == nil { state.selectionBeforeDrag = selectedIDs }
-                    let rect = CGRect(
-                        x: min(value.startLocation.x, value.location.x),
-                        y: min(value.startLocation.y, value.location.y),
-                        width: abs(value.location.x - value.startLocation.x),
-                        height: abs(value.location.y - value.startLocation.y)
-                    )
-                    state.marquee = rect
-                    let inside = Set(items.compactMap { photo in
-                        state.frames[photo.id]?.intersects(rect) == true ? photo.id : nil
-                    })
-                    selectedIDs = state.selectionBeforeDrag!.union(inside)
-                    state.suppressClickUntil = Date().addingTimeInterval(0.4)
-                }
-                .onEnded { _ in
-                    state.marquee = nil
-                    state.selectionBeforeDrag = nil
-                    state.suppressClickUntil = Date().addingTimeInterval(0.4)
-                }
-        )
+        NativeLibraryGrid(entries: photos.map { NativeLibraryEntry(id: $0.id, remoteURL: mediaURL($0)) },
+                          selectedIDs: $selectedIDs, deleteSelection: deleteSelection)
     }
 }
 
 struct ContentView: View {
     @StateObject private var model = AlbumModel()
+    @ObservedObject private var account = AccountModel.shared
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
@@ -769,8 +835,11 @@ struct ContentView: View {
                     }
                 }
                 Button("连接") { model.connect() }.disabled(model.busy)
+                Button("核对手机端") { model.checkCloudAlbums() }.disabled(model.busy || model.deviceID == nil)
                 Spacer()
-                Text("TimesFrame 相册管理").font(.headline)
+                Text("TimesFrame · \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")").font(.headline)
+                Button("表盘工作台") { model.showWorkbench = true }.disabled(model.busy || model.deviceID == nil)
+                Button(account.session?.nickname ?? "账号与设备控制") { model.showSettings = true }.disabled(model.busy)
             }
             .padding(14)
             Divider()
@@ -779,22 +848,28 @@ struct ContentView: View {
                     HStack {
                         Text("相册").font(.headline)
                         Spacer()
-                        Button("新建") { model.albumNameInput = ""; model.showNewAlbum = true }
-                        .help("新建相册")
+                        Button("新建本地") { model.albumNameInput = ""; model.showNewAlbum = true }
+                        .help("只在设备本地新建；手机同步相册请在手机 App 创建后刷新")
                         .disabled(model.busy || model.albums.isEmpty)
                     }
                     .padding(.horizontal, 12).padding(.vertical, 10)
-                    List(model.albums, selection: $model.selectedAlbumID) { album in
+                    List(model.albums, selection: Binding(get: { model.selectedAlbumID }, set: { id in
+                        if let album = model.albums.first(where: { $0.id == id }) { model.select(album) }
+                    })) { album in
                         HStack {
                             Image(systemName: album.type == 1 ? "photo.on.rectangle" : "rectangle.stack")
                             Text(album.name).lineLimit(1)
+                            if album.canEdit, let cloudIDs = model.cloudClockIDs {
+                                Image(systemName: cloudIDs.contains(album.id) ? "icloud" : "internaldrive")
+                                    .help(cloudIDs.contains(album.id) ? "手机端列表中存在此相册" : "仅设备本地，手机端列表中不存在")
+                            }
                             if !album.canEdit { Image(systemName: "lock").font(.caption2) }
                         }
                         .tag(album.id)
                         .contentShape(Rectangle())
-                        .onTapGesture { model.select(album) }
                     }
                     .listStyle(.sidebar)
+                    .disabled(model.busy)
                     HStack {
                         Button("重命名") {
                             model.albumNameInput = model.selectedAlbum?.name ?? ""
@@ -820,16 +895,20 @@ struct ContentView: View {
                         Button("刷新") { model.refresh() }.disabled(model.busy || model.selectedAlbum == nil)
                         Button("从 Mac 相册…") { model.showLibrary = true }
                             .disabled(model.busy || model.selectedAlbum?.canEdit != true || model.photos.count >= AlbumAPI.maxPhotosPerAlbum)
+                        Button("上传文件夹…") { model.importFolder() }
+                            .disabled(model.busy || model.selectedAlbum?.canEdit != true || model.photos.count >= AlbumAPI.maxPhotosPerAlbum)
                         Button("上传照片…") { model.showImporter = true }
                             .disabled(model.busy || model.selectedAlbum?.canEdit != true || model.photos.count >= AlbumAPI.maxPhotosPerAlbum)
                     }
                     .padding(12)
                     Divider()
-                    ScrollView {
+                    VStack(spacing: 0) {
                         SelectablePhotoGrid(photos: model.photos,
                             mediaURL: { try? model.apiURL($0.thumbnailPath) },
-                            selectedIDs: $model.selectedPhotoIDs)
-                        .padding(14)
+                            selectedIDs: $model.selectedPhotoIDs,
+                            deleteSelection: { if model.selectedAlbum?.canEdit == true { model.showDelete = true } })
+                        .id(model.selectedAlbumID)
+                        .disabled(model.busy)
                         if model.canLoadMore {
                             Button("加载更多") { model.loadMore() }
                                 .disabled(model.busy).padding()
@@ -864,13 +943,31 @@ struct ContentView: View {
             Divider()
             HStack {
                 if model.busy { ProgressView().controlSize(.small) }
+                if !model.connectedIP.isEmpty {
+                    Text("设备 \(model.connectedIP):\(model.connectedPort)").font(.caption).foregroundStyle(.secondary)
+                    Divider().frame(height: 14)
+                }
                 Text(model.status).foregroundStyle(model.isError ? Color.red : Color.secondary)
                     .textSelection(.enabled)
                 Spacer()
+                Button("本地网络权限…") { model.openNetworkSettings() }
             }
             .padding(10)
         }
-        .frame(minWidth: 850, minHeight: 580)
+        .frame(minWidth: 1050, minHeight: 650)
+        .background(MainWindowLifecycle().allowsHitTesting(false))
+        .onAppear { model.connectionForAccount() }
+        .onChange(of: account.session?.userID) { _ in model.connectionForAccount() }
+        .sheet(isPresented: $model.showSettings, onDismiss: {
+            if model.deviceID != nil { model.refresh() }
+        }) {
+            DeviceSettingsView(ip: model.connectedIP, port: model.connectedPort,
+                               deviceID: model.deviceID, connected: model.deviceID != nil,
+                               syncMessage: model.syncMessage)
+        }
+        .sheet(isPresented: $model.showWorkbench) {
+            WatchfaceWorkbench(ip: model.connectedIP, port: model.connectedPort)
+        }
         .sheet(isPresented: $model.showLibrary) {
             MacPhotoLibraryView(maxSelection: max(0, AlbumAPI.maxPhotosPerAlbum - model.photos.count),
                                 albumName: model.selectedAlbum?.name ?? "相册",
@@ -878,7 +975,10 @@ struct ContentView: View {
                                 upload: { model.importLibraryPhotos($0) })
         }
         .fileImporter(isPresented: $model.showImporter, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
-            if case let .success(urls) = result { model.importFiles(urls) }
+            switch result {
+            case .success(let urls): model.importFiles(urls)
+            case .failure(let error): model.isError = true; model.status = "读取文件失败：\(error.localizedDescription)"
+            }
         }
         .alert("从设备删除照片？", isPresented: $model.showDelete) {
             Button("删除设备原图", role: .destructive) { model.deleteSelected() }
@@ -886,33 +986,36 @@ struct ContentView: View {
         } message: {
             Text("这会删除选中的 \(model.selectedPhotoIDs.count) 张设备照片，并影响引用它们的其他相册。此操作无法撤销。")
         }
-        .alert("新建相册", isPresented: $model.showNewAlbum) {
+        .alert("新建设备本地相册", isPresented: $model.showNewAlbum) {
             TextField("相册名称", text: $model.albumNameInput)
             Button("创建") { model.createAlbum() }
             Button("取消", role: .cancel) { }
         } message: {
-            Text("相册会直接创建在 Times Frame 上。")
+            Text("此操作仅在相框本地创建，手机 App 不会自动显示。需要手机可见的相册，请先在手机 App 创建，然后点击本客户端的刷新。")
         }
-        .alert("重命名相册", isPresented: $model.showRenameAlbum) {
+        .alert("重命名设备本地相册", isPresented: $model.showRenameAlbum) {
             TextField("相册名称", text: $model.albumNameInput)
             Button("保存") { model.renameSelectedAlbum() }
             Button("取消", role: .cancel) { }
+        } message: {
+            Text("只修改设备本地名称；手机云端的相册名称不会改变。")
         }
         .alert("删除相册？", isPresented: $model.showDeleteAlbum) {
             Button("删除相册", role: .destructive) { model.deleteSelectedAlbum() }
             Button("取消", role: .cancel) { }
         } message: {
-            Text("将从相框删除“\(model.selectedAlbum?.name ?? "")”及其相册归属。此操作无法撤销；原图是否保留取决于设备固件。")
+            Text("此操作只修改设备本地相册，不会删除手机云端列表中的记录。将从相框删除“\(model.selectedAlbum?.name ?? "")”及其相册归属。此操作无法撤销；原图是否保留取决于设备固件。")
         }
         .sheet(isPresented: $model.showAddSheet) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("从全部照片加入“\(model.selectedAlbum?.name ?? "相册")”").font(.headline)
                 Text("从设备照片中选择；每次加载 100 张，加入时不会复制文件。")
                     .foregroundStyle(.secondary)
-                ScrollView {
+                VStack {
                     SelectablePhotoGrid(photos: model.allPhotosForAdd,
                         mediaURL: { try? model.apiURL($0.thumbnailPath) },
                         selectedIDs: $model.addSelected)
+                        .disabled(model.busy)
                     if model.canLoadMoreForAdd {
                         Button("加载更多") { model.loadMoreForAdd() }
                             .disabled(model.busy).padding()
@@ -946,6 +1049,6 @@ final class TimesFrameAppDelegate: NSObject, NSApplicationDelegate {
 #if !FRAME_TEST
 @main struct TimesFrameAlbumApp: App {
     @NSApplicationDelegateAdaptor(TimesFrameAppDelegate.self) private var appDelegate
-    var body: some Scene { WindowGroup { ContentView() } }
+    var body: some Scene { Window("TimesFrame 相册管理", id: "main") { ContentView() } }
 }
 #endif
