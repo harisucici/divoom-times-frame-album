@@ -1,6 +1,17 @@
-# Times Frame 相册管理（macOS）
+# Times Frame 相册管理（macOS / Windows x64）
 
 适用于 Apple 芯片 Mac 的 Divoom Times Frame 本地相册客户端。通过同一局域网直接连接相框，无需在 Mac 上安装官方手机 App。当前版本 **0.8.1**。
+
+
+## Windows x64 版本
+
+新增 Windows 10／11 Intel／AMD 64 位原生客户端 **0.9.0**，支持相册管理、Ctrl／Shift 多选和框选、文件夹上传、账号与设备控制、表盘工作台。发布包自带 .NET 10 运行时；完整解压后运行 TimesFrameAlbum.exe。详细使用、功能边界和构建方法见 [Windows 说明](Windows/README.md)。macOS 版继续使用下方说明和 build.sh。
+
+```powershell
+./Windows/build.ps1
+```
+
+GitHub Actions 的 Windows x64 工作流会在 Windows 上构建并提供便携 ZIP。
 
 ## 功能
 

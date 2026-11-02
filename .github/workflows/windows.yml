@@ -1,0 +1,45 @@
+name: Windows x64
+on:
+  workflow_dispatch:
+  push:
+    paths: ['Windows/**', 'Resources/TimesFrame/**', '.github/workflows/windows.yml']
+  pull_request:
+    paths: ['Windows/**', 'Resources/TimesFrame/**', '.github/workflows/windows.yml']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Test and publish self-contained x64
+        shell: pwsh
+        run: ./Windows/build.ps1
+      - name: Windows UI and lifecycle smoke test
+        shell: pwsh
+        run: |
+          $process = Start-Process './Windows/artifacts/win-x64/TimesFrameAlbum.exe' -ArgumentList '--self-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            if (Test-Path windows-smoke-error.txt) { Get-Content windows-smoke-error.txt }
+            throw "Windows UI smoke test failed: $($process.ExitCode)"
+          }
+      - name: Package portable app
+        shell: pwsh
+        run: Compress-Archive -Path Windows/artifacts/win-x64/* -DestinationPath Windows/artifacts/TimesFrame-0.9.0-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TimesFrame-0.9.0-windows-x64
+          path: Windows/artifacts/TimesFrame-0.9.0-windows-x64.zip
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-ui-diagnostics
+          path: |
+            windows-smoke.png
+            windows-smoke-error.txt
+          if-no-files-found: ignore
