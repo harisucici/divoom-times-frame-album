@@ -7,5 +7,6 @@ if (-not $SkipTests) {
 dotnet publish "$PSScriptRoot/TimesFrame.Windows/TimesFrame.Windows.csproj" -c Release -r win-x64 --self-contained true -p:DebugType=None -p:DebugSymbols=false -o $Output
 if ($LASTEXITCODE -ne 0) { throw 'Windows x64 publish failed.' }
 Copy-Item "$PSScriptRoot/README.md" "$Output/README-zh-CN.md" -Force
-Copy-Item "$PSScriptRoot/THIRD-PARTY-NOTICES" "$Output/THIRD-PARTY-NOTICES" -Recurse -Force
+New-Item -ItemType Directory -Path "$Output/THIRD-PARTY-NOTICES" -Force | Out-Null
+Copy-Item "$PSScriptRoot/THIRD-PARTY-NOTICES/*" "$Output/THIRD-PARTY-NOTICES/" -Force
 Write-Host "Ready: $Output/TimesFrameAlbum.exe (Windows x64, self-contained)"

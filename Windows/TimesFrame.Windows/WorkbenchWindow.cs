@@ -5,46 +5,194 @@ using System.Windows.Controls;
 using Microsoft.Win32;
 using TimesFrame.Core;
 namespace TimesFrame.Windows;
-public sealed class WorkbenchWindow : ToolWindow {
-    readonly FrameClient frame;readonly WatchfaceClient service;readonly TextBox output=Ui.Editor(),editor=Ui.Editor(),clockId=Field("60000"),name=Field("Windows 本地表盘",230);
-    readonly CheckBox current=new(){Content="当前显示的表盘",IsChecked=true,Margin=new Thickness(4),VerticalAlignment=VerticalAlignment.Center};DialAsset? asset;readonly TextBlock assetLabel=Note("未选择背景或素材包");byte[]? screenshot;readonly Image screen=new(){Width=225,Height=360,Stretch=System.Windows.Media.Stretch.Uniform};
-    static string CatalogDirectory=>Path.Combine(AppContext.BaseDirectory,"Resources","TimesFrame");
-    static string Read(string file)=>File.ReadAllText(Path.Combine(CatalogDirectory,file));
-    public WorkbenchWindow(FrameClient api):base("Times Frame 表盘工作台 · 800×1280",1130,800){frame=api;service=new(api);editor.Text=Read("example-minimal.json");output.IsReadOnly=true;Overview();Edit();BackgroundTab();Catalog();ConsoleTab();}
-    int? Target(){if(current.IsChecked==true)return null;if(!int.TryParse(clockId.Text,out var id)||id<=0)throw new FrameException("请输入正整数表盘 ID。");return id;}
-    void Overview(){
-        var panel=Stack();clockId.IsEnabled=false;current.Checked+=(_,_)=>clockId.IsEnabled=false;current.Unchecked+=(_,_)=>clockId.IsEnabled=true;
-        panel.Children.Add(Row(Button("设备信息",()=>ReadCommand("Device/GetHardwareVersion")),Button("设备字体",()=>ReadCommand("Device/GetLocalFontList")),Button("设备商店缓存",()=>ReadCommand("Device/GetStoreClockMarketList")),current,clockId,Button("读取所选配置",async()=>await Run("读取表盘配置",async ct=>{await frame.Identify(ct);output.Text=Json.Pretty(await service.Local(Target(),ct));}))));
+
+public sealed class WorkbenchWindow : ToolWindow
+{
+    readonly FrameClient frame; readonly WatchfaceClient service; readonly TextBox output = Ui.Editor(), editor = Ui.Editor(), clockId = Field("60000"), name = Field("Windows 本地表盘", 230);
+    readonly CheckBox current = new() { Content = "当前显示的表盘", IsChecked = true, Margin = new Thickness(4), VerticalAlignment = VerticalAlignment.Center }; DialAsset? asset; readonly TextBlock assetLabel = Note("未选择背景或素材包"); byte[]? screenshot; readonly Image screen = new() { Width = 225, Height = 360, Stretch = System.Windows.Media.Stretch.Uniform };
+    static string CatalogDirectory => Path.Combine(AppContext.BaseDirectory, "Resources", "TimesFrame");
+    static string Read(string file) => File.ReadAllText(Path.Combine(CatalogDirectory, file));
+    public WorkbenchWindow(FrameClient api) : base("Times Frame 表盘工作台 · 800×1280", 1130, 800) { frame = api; service = new(api); editor.Text = Read("example-minimal.json"); output.IsReadOnly = true; Overview(); Edit(); BackgroundTab(); Catalog(); ConsoleTab(); }
+    int? Target()
+    {
+        if (current.IsChecked == true)
+            return null;
+        if (!int.TryParse(clockId.Text, out var id) || id <= 0)
+            throw new FrameException("请输入正整数表盘 ID。");
+        return id;
+    }
+    void Overview()
+    {
+        var panel = Stack();
+        clockId.IsEnabled = false;
+        current.Checked += (_, _) => clockId.IsEnabled = false;
+        current.Unchecked += (_, _) => clockId.IsEnabled = true;
+        panel.Children.Add(Row(Button("设备信息", () => ReadCommand("Device/GetHardwareVersion")), Button("设备字体", () => ReadCommand("Device/GetLocalFontList")), Button("设备商店缓存", () => ReadCommand("Device/GetStoreClockMarketList")), current, clockId, Button("读取所选配置", async () => await Run("读取表盘配置", async ct => { await frame.Identify(ct); output.Text = Json.Pretty(await service.Local(Target(), ct)); }))));
         panel.Children.Add(Note("相册及部分系统表盘没有本地可编辑配置；商店缓存为空可能是设备尚未预取。读取其他表盘仅供参考，编辑和创建使用管理槽位 60000。"));
-        var grid=new Grid{Height=480};grid.ColumnDefinitions.Add(new());grid.ColumnDefinitions.Add(new(){Width=new GridLength(245)});grid.Children.Add(output);var right=new StackPanel();right.Children.Add(screen);
-        right.Children.Add(Button("获取设备截图",async()=>await Run("获取设备截图",async ct=>{screenshot=await service.Snapshot(ct);screen.Source=Ui.Image(screenshot);})));right.Children.Add(Button("保存 PNG…",()=>{if(screenshot==null)return;var save=new SaveFileDialog{FileName="TimesFrame-截图.png",Filter="PNG|*.png"};if(save.ShowDialog(this)==true)File.WriteAllBytes(save.FileName,screenshot);}));right.Children.Add(Note("固件截图可能有缓存延迟。"));Grid.SetColumn(right,1);grid.Children.Add(right);panel.Children.Add(grid);panel.Children.Add(Button("导出设备 JSON…",()=>Save(output.Text)));Tab("设备与截图",panel);
+        var grid = new Grid { Height = 480 };
+        grid.ColumnDefinitions.Add(new());
+        grid.ColumnDefinitions.Add(new()
+        {
+            Width = new GridLength(245)
+        });
+        grid.Children.Add(output);
+        var right = new StackPanel();
+        right.Children.Add(screen);
+        right.Children.Add(Button("获取设备截图", async () => await Run("获取设备截图", async ct => { screenshot = await service.Snapshot(ct); screen.Source = Ui.Image(screenshot); })));
+        right.Children.Add(Button("保存 PNG…", () => { if (screenshot == null) return; var save = new SaveFileDialog { FileName = "TimesFrame-截图.png", Filter = "PNG|*.png" }; if (save.ShowDialog(this) == true) File.WriteAllBytes(save.FileName, screenshot); }));
+        right.Children.Add(Note("固件截图可能有缓存延迟。"));
+        Grid.SetColumn(right, 1);
+        grid.Children.Add(right);
+        panel.Children.Add(grid);
+        panel.Children.Add(Button("导出设备 JSON…", () => Save(output.Text)));
+        Tab("设备与截图", panel);
     }
-    async void ReadCommand(string command)=>await Run("读取设备",async ct=>{await frame.Identify(ct);output.Text=Json.Pretty(await frame.Command(command,ct:ct));});
-    void ChooseAsset(){var file=new OpenFileDialog{Title="背景图片会居中裁切为 800×1280；也可选择 tar.gz 素材包",Filter="图片和素材包|*.jpg;*.jpeg;*.png;*.webp;*.bmp;*.gif;*.tar.gz;*.tgz"};if(file.ShowDialog(this)!=true)return;try{asset=DialAsset.Load(file.FileName);assetLabel.Text=$"{asset.Name} · {(asset.Bundle?"素材包":"800×1280 JPEG，居中裁切")} · {asset.Bytes.Length/1024} KiB";}catch(Exception e){Status.Text=e.Message;}}
-    void Edit(){
-        var panel=new DockPanel{Margin=new Thickness(14)};var top=new StackPanel();top.Children.Add(Note("管理槽位固定为 60000。先读取已有配置；微调时保留 item_id。完整列表的元素数量不变时自动生成局部补丁，写入前校验设备字体。"));
-        top.Children.Add(Row(Button("读取 60000 到编辑器",async()=>await Run("读取管理表盘",async ct=>{await frame.Identify(ct);var value=await service.Managed(ct)??throw new FrameException("60000 尚未创建，请先使用模板并选择背景。");var body=new JsonObject();foreach(var k in new[]{"ItemList","ItemIdList","SetColorList","DeviceImageUrl","DevicePreviewImageUrl","DevicePreviewImageUrl2"})if(value[k]is{}n)body[k]=n.DeepClone();if(body["ItemIdList"]==null)body["ItemIdList"]=new JsonArray(body.Rows("ItemList").Select(r=>(JsonNode?)JsonValue.Create(r.Str("item_id"))).ToArray());editor.Text=Json.Pretty(body);output.Text=Json.Pretty(value);})),Button("最小时间模板",()=>{editor.Text=Read("example-minimal.json");asset=null;assetLabel.Text="未选择背景或素材包";}),Button("选择背景／素材包…",ChooseAsset)));
-        top.Children.Add(assetLabel);top.Children.Add(Row(Note("首次创建名称"),name,Button("仅更新已有表盘…",()=>Write(true)),Button("创建／更新表盘…",()=>Write(false)),Button("播放 60000…",async()=>{if(!Ui.Confirm(this,"切换设备当前显示为 60000 号本地表盘？将覆盖当前时段的轮播选择。"))return;await Run("播放本地表盘",async ct=>{await frame.Identify(ct);if(await service.Managed(ct)==null)throw new FrameException("请先创建本地表盘。");for(var i=0;i<2;i++)await frame.Command("Channel/SetClockSelectId",new(){["ClockId"]=60000},ct);});})));
-        top.Children.Add(Note("支持 ItemList＋ItemIdList 完整配置，或 ItemPatchList／ItemPatchByRoleList 字段补丁。官方模板不含图像素材；写入后请在设备与截图页核对回读和实际画面。"));DockPanel.SetDock(top,Dock.Top);panel.Children.Add(top);panel.Children.Add(editor);Tab("本地表盘",panel);
+    async void ReadCommand(string command) => await Run("读取设备", async ct => { await frame.Identify(ct); output.Text = Json.Pretty(await frame.Command(command, ct: ct)); });
+    void ChooseAsset()
+    {
+        var file = new OpenFileDialog { Title = "背景图片会居中裁切为 800×1280；也可选择 tar.gz 素材包", Filter = "图片和素材包|*.jpg;*.jpeg;*.png;*.webp;*.bmp;*.gif;*.tar.gz;*.tgz" };
+        if (file.ShowDialog(this) != true)
+            return;
+        try
+        {
+            asset = DialAsset.Load(file.FileName);
+            assetLabel.Text = $"{asset.Name} · {(asset.Bundle ? "素材包" : "800×1280 JPEG，居中裁切")} · {asset.Bytes.Length / 1024} KiB";
+        }
+        catch (Exception e) { Status.Text = e.Message; }
     }
-    async void Write(bool existing){if(!Ui.Confirm(this,existing?"更新管理槽位 60000？会改变该槽位的元素和背景。":"将完整配置和素材写入管理槽位 60000：不存在时创建，存在时更新。确认继续？"))return;await Run("写入并回读配置",async ct=>{output.Text=Json.Pretty(await service.Upsert(Json.Parse(editor.Text),asset,name.Text,existing,ct));});}
-    void BackgroundTab(){
-        var panel=Stack();panel.Children.Add(Note("目标由“设备与截图”页的当前显示／表盘 ID 选项决定。背景替换只修改缓存位图，恢复云端版本会先清除本地文件。"));panel.Children.Add(Button("选择背景图片／素材包…",ChooseAsset));panel.Children.Add(Note("图片会居中裁切到 800×1280 JPEG，压缩至 500 KiB 以下。素材包只用于本地表盘创建／更新，不用于缓存背景替换。"));
-        panel.Children.Add(Button("替换所选表盘缓存背景…",async()=>{if(!Ui.Confirm(this,"替换所选表盘缓存背景？恢复云端版本可能覆盖此修改。"))return;await Run("替换缓存背景",async ct=>{if(asset==null)throw new FrameException("请先选择图片。");output.Text=Json.Pretty(await service.Replace(asset,Target(),ct));});}));
-        panel.Children.Add(Button("恢复指定 ID 的云端版本…",async()=>{if(!Ui.Confirm(this,$"将先删除表盘 {clockId.Text} 的本地文件，再尝试从云端恢复。网络失败时可能暂时不可用；建议先导出配置。本地素材不会备份，确认继续？"))return;await Run("恢复云端表盘",async ct=>{var id=Target()??throw new FrameException("恢复前请取消“当前显示的表盘”并明确指定 ID。");await frame.Identify(ct);output.Text=Json.Pretty(await frame.Command("Device/ResetLocalClockFromServer",new(){["ClockId"]=id},ct));});}));panel.Children.Add(Note("操作结果在“设备与截图”页显示；JSON 回读不保证所有素材已渲染，请重新截图检查。"));Tab("背景与恢复",panel);
+    void Edit()
+    {
+        var panel = new DockPanel { Margin = new Thickness(14) };
+        var top = new StackPanel();
+        top.Children.Add(Note("管理槽位固定为 60000。先读取已有配置；微调时保留 item_id。完整列表的元素数量不变时自动生成局部补丁，写入前校验设备字体。"));
+        top.Children.Add(Row(Button("读取 60000 到编辑器", async () => await Run("读取管理表盘", async ct => { await frame.Identify(ct); var value = await service.Managed(ct) ?? throw new FrameException("60000 尚未创建，请先使用模板并选择背景。"); var body = new JsonObject(); foreach (var k in new[] { "ItemList", "ItemIdList", "SetColorList", "DeviceImageUrl", "DevicePreviewImageUrl", "DevicePreviewImageUrl2" }) if (value[k] is { } n) body[k] = n.DeepClone(); if (body["ItemIdList"] == null) body["ItemIdList"] = new JsonArray(body.Rows("ItemList").Select(r => (JsonNode?)JsonValue.Create(r.Str("item_id"))).ToArray()); editor.Text = Json.Pretty(body); output.Text = Json.Pretty(value); })), Button("最小时间模板", () => { editor.Text = Read("example-minimal.json"); asset = null; assetLabel.Text = "未选择背景或素材包"; }), Button("选择背景／素材包…", ChooseAsset)));
+        top.Children.Add(assetLabel);
+        top.Children.Add(Row(Note("首次创建名称"), name, Button("仅更新已有表盘…", () => Write(true)), Button("创建／更新表盘…", () => Write(false)), Button("播放 60000…", async () => { if (!Ui.Confirm(this, "切换设备当前显示为 60000 号本地表盘？将覆盖当前时段的轮播选择。")) return; await Run("播放本地表盘", async ct => { await frame.Identify(ct); if (await service.Managed(ct) == null) throw new FrameException("请先创建本地表盘。"); for (var i = 0; i < 2; i++) await frame.Command("Channel/SetClockSelectId", new() { ["ClockId"] = 60000 }, ct); }); })));
+        top.Children.Add(Note("支持 ItemList＋ItemIdList 完整配置，或 ItemPatchList／ItemPatchByRoleList 字段补丁。官方模板不含图像素材；写入后请在设备与截图页核对回读和实际画面。"));
+        DockPanel.SetDock(top, Dock.Top);
+        panel.Children.Add(top);
+        panel.Children.Add(editor);
+        Tab("本地表盘", panel);
     }
-    sealed record Entry(string Label,JsonObject Data){public override string ToString()=>Label;}
-    static JsonObject Draft(JsonObject config){var result=config.DeepClone().AsObject();var items=result["ItemList"]as JsonArray??new();var seen=new HashSet<string>();var ids=new JsonArray();for(var i=0;i<items.Count;i++){if(items[i]is not JsonObject row)continue;var id=row.Str("item_id");if(id.Length==0||seen.Contains(id))id="win_item_"+i;while(!seen.Add(id))id+="_";row["item_id"]=id;ids.Add(id);}result["ItemIdList"]=ids;result["ClockId"]=60000;return result;}
-    void Catalog(){
-        var panel=new DockPanel{Margin=new Thickness(14)};var kind=new ComboBox{Width=145,ItemsSource=new[]{"模板","表盘","字体","显示元素","协议说明","字体说明"},SelectedIndex=0};var search=Field("",270);var disp=Field("5",70);var details=Ui.Editor();details.IsReadOnly=true;var list=new ListBox{Width=280};List<Entry> entries=[];
-        void Filter()=>list.ItemsSource=entries.Where(e=>(e.Label+e.Data.ToJsonString()).Contains(search.Text,StringComparison.OrdinalIgnoreCase)).ToArray();
-        void Load(){try{var selected=kind.SelectedItem?.ToString()??"模板";var maps=new Dictionary<string,(string,string)>{{"模板",("templates-curated.json","templates")},{"表盘",("clock-catalog.json","clocks")},{"字体",("font-catalog.json","fonts")},{"显示元素",("disp-catalog.json","displays")}};
-            if(maps.TryGetValue(selected,out var map)){entries=Json.Parse(Read(map.Item1)).Rows(map.Item2).Select(row=>new Entry($"{row["clockId"]??row["disp"]??row["id"]} · {row["nameCn"]??row["description_zh"]??row["name"]}",row)).ToList();details.Text="选择一条查看详情。字体安装情况请以设备字体列表为准。";}else{entries=[];details.Text=Read(selected=="协议说明"?"guide-quick-reference.md":"ai-font-guide.md");}Filter();}catch(Exception e){Status.Text=e.Message;}}
-        list.SelectionChanged+=(_,_)=>{if(list.SelectedItem is not Entry entry)return;var data=entry.Data.DeepClone().AsObject();if(kind.SelectedItem?.ToString()=="表盘"){var configs=Json.Parse(Read("clock-configs.json"))["configurations"]as JsonObject;data["configuration"]=configs?[entry.Data.Str("clockId")]?.DeepClone();}details.Text=Json.Pretty(data);};kind.SelectionChanged+=(_,_)=>Load();search.TextChanged+=(_,_)=>Filter();
-        var top=new StackPanel();top.Children.Add(Row(kind,Note("搜索"),search,Button("模板载入草稿",()=>{try{if(list.SelectedItem is not Entry entry||entry.Data["watchface"]is not JsonObject config)throw new FrameException("请选择官方模板。");if(config["ItemList"]is not JsonArray{Count:>0})throw new FrameException("此项只有背景参考，请使用最小时间模板。");editor.Text=Json.Pretty(Draft(config));asset=null;assetLabel.Text="未选择背景或素材包";Status.Text="已载入草稿；请切换本地表盘页检查并选择素材，尚未写入设备。";}catch(Exception e){Status.Text=e.Message;}})));
-        top.Children.Add(Row(Note("显示元素 disp"),disp,Button("生成布局建议",()=>{try{var id=int.Parse(disp.Text);var row=Json.Parse(Read("disp-catalog.json")).Rows("displays").First(r=>r.Int("disp")==id);var tw=row["typography"]as JsonObject??throw new FrameException("此元素暂无布局统计。");var suggested=new JsonObject{["disp"]=id,["size"]=tw["size"]?["p50"]?.DeepClone(),["alig"]=tw["alig"]?["mode"]?.DeepClone()??JsonValue.Create(3)};foreach(var key in new[]{"x","y","w","h"})suggested[key]=tw["box"]?[key]?["p50"]?.DeepClone();foreach(var key in new[]{"color_1","color_2"})if(tw["colorHints"]?[key+"_common"]is JsonArray{Count:>0}colors)suggested[key]=colors[0]?.DeepClone();details.Text=Json.Pretty(new JsonObject{["canvas"]=new JsonObject{["width"]=800,["height"]=1280},["suggestedItemFields"]=suggested,["说明"]="取官方样本中位数，应用前限制在画布内并以设备截图核对。"});}catch(Exception e){Status.Text=e.Message;}})));
-        DockPanel.SetDock(top,Dock.Top);panel.Children.Add(top);var bottom=Note("DivoomDevelop/mcp-divoom-lan · MIT · TimesFrame 专用参考目录；模板不含图像素材，设备安装情况可能不同。");DockPanel.SetDock(bottom,Dock.Bottom);panel.Children.Add(bottom);var grid=new Grid();grid.ColumnDefinitions.Add(new(){Width=new GridLength(290)});grid.ColumnDefinitions.Add(new());grid.Children.Add(list);Grid.SetColumn(details,1);grid.Children.Add(details);panel.Children.Add(grid);Load();Tab("官方素材目录",panel);
+    async void Write(bool existing)
+    {
+        if (!Ui.Confirm(this, existing ? "更新管理槽位 60000？会改变该槽位的元素和背景。" : "将完整配置和素材写入管理槽位 60000：不存在时创建，存在时更新。确认继续？"))
+            return;
+        await Run("写入并回读配置", async ct => { output.Text = Json.Pretty(await service.Upsert(Json.Parse(editor.Text), asset, name.Text, existing, ct)); });
     }
-    void ConsoleTab(){var panel=new DockPanel{Margin=new Thickness(14)};var command=Field("Device/GetHardwareVersion",440);var fields=Ui.Editor("{}");var top=new StackPanel();top.Children.Add(Note("直接向已连接设备发送 JSON。参数不含 Command 和 ReturnCode；创建与修改表盘请走专用页面。写入命令可能改变或删除设备内容。"));top.Children.Add(Row(command,Button("发送命令…",async()=>{if(!Ui.Confirm(this,$"目标 {frame.Ip}:{frame.Port}\n命令 {command.Text}\n确认参数并发送？"))return;await Run("发送高级命令",async ct=>{await frame.Identify(ct);var name=command.Text.Trim();if(name.Length==0||name is "Device/CreateLocalClock"or"Device/PatchLocalClockInfo"or"Device/UploadLocalAsset")throw new FrameException("请使用专用页面；AstroToo 独立素材接口不适用于此设备。");output.Text=Json.Pretty(await frame.Command(name,Json.Parse(fields.Text),ct));});})));DockPanel.SetDock(top,Dock.Top);panel.Children.Add(top);panel.Children.Add(fields);Tab("高级命令",panel);}
-    void Save(string text){var save=new SaveFileDialog{FileName="TimesFrame-设备数据.json",Filter="JSON|*.json"};if(save.ShowDialog(this)==true)try{File.WriteAllText(save.FileName,text);}catch(Exception e){Status.Text=e.Message;}}
+    void BackgroundTab()
+    {
+        var panel = Stack();
+        panel.Children.Add(Note("目标由“设备与截图”页的当前显示／表盘 ID 选项决定。背景替换只修改缓存位图，恢复云端版本会先清除本地文件。"));
+        panel.Children.Add(Button("选择背景图片／素材包…", ChooseAsset));
+        panel.Children.Add(Note("图片会居中裁切到 800×1280 JPEG，压缩至 500 KiB 以下。素材包只用于本地表盘创建／更新，不用于缓存背景替换。"));
+        panel.Children.Add(Button("替换所选表盘缓存背景…", async () => { if (!Ui.Confirm(this, "替换所选表盘缓存背景？恢复云端版本可能覆盖此修改。")) return; await Run("替换缓存背景", async ct => { if (asset == null) throw new FrameException("请先选择图片。"); output.Text = Json.Pretty(await service.Replace(asset, Target(), ct)); }); }));
+        panel.Children.Add(Button("恢复指定 ID 的云端版本…", async () => { if (!Ui.Confirm(this, $"将先删除表盘 {clockId.Text} 的本地文件，再尝试从云端恢复。网络失败时可能暂时不可用；建议先导出配置。本地素材不会备份，确认继续？")) return; await Run("恢复云端表盘", async ct => { var id = Target() ?? throw new FrameException("恢复前请取消“当前显示的表盘”并明确指定 ID。"); await frame.Identify(ct); output.Text = Json.Pretty(await frame.Command("Device/ResetLocalClockFromServer", new() { ["ClockId"] = id }, ct)); }); }));
+        panel.Children.Add(Note("操作结果在“设备与截图”页显示；JSON 回读不保证所有素材已渲染，请重新截图检查。"));
+        Tab("背景与恢复", panel);
+    }
+    sealed record Entry(string Label, JsonObject Data)
+    {
+        public override string ToString() => Label;
+    }
+    static JsonObject Draft(JsonObject config)
+    {
+        var result = config.DeepClone().AsObject();
+        var items = result["ItemList"] as JsonArray ?? new();
+        var seen = new HashSet<string>();
+        var ids = new JsonArray();
+        for (var i = 0; i < items.Count; i++)
+        {
+            if (items[i] is not JsonObject row)
+                continue;
+            var id = row.Str("item_id");
+            if (id.Length == 0 || seen.Contains(id))
+                id = "win_item_" + i;
+            while (!seen.Add(id))
+                id += "_";
+            row["item_id"] = id;
+            ids.Add(id);
+        }
+        result["ItemIdList"] = ids;
+        result["ClockId"] = 60000;
+        return result;
+    }
+    void Catalog()
+    {
+        var panel = new DockPanel { Margin = new Thickness(14) };
+        var kind = new ComboBox { Width = 145, ItemsSource = new[] { "模板", "表盘", "字体", "显示元素", "协议说明", "字体说明" }, SelectedIndex = 0 };
+        var search = Field("", 270);
+        var disp = Field("5", 70);
+        var details = Ui.Editor();
+        details.IsReadOnly = true;
+        var list = new ListBox { Width = 280 };
+        List<Entry> entries = [];
+        void Filter() => list.ItemsSource = entries.Where(e => (e.Label + e.Data.ToJsonString()).Contains(search.Text, StringComparison.OrdinalIgnoreCase)).ToArray();
+        void Load()
+        {
+            try
+            {
+                var selected = kind.SelectedItem?.ToString() ?? "模板";
+                var maps = new Dictionary<string, (string, string)> { { "模板", ("templates-curated.json", "templates") }, { "表盘", ("clock-catalog.json", "clocks") }, { "字体", ("font-catalog.json", "fonts") }, { "显示元素", ("disp-catalog.json", "displays") } };
+                if (maps.TryGetValue(selected, out var map))
+                {
+                    entries = Json.Parse(Read(map.Item1)).Rows(map.Item2).Select(row => new Entry($"{row["clockId"] ?? row["disp"] ?? row["id"]} · {row["nameCn"] ?? row["description_zh"] ?? row["name"]}", row)).ToList();
+                    details.Text = "选择一条查看详情。字体安装情况请以设备字体列表为准。";
+                }
+                else
+                {
+                    entries = [];
+                    details.Text = Read(selected == "协议说明" ? "guide-quick-reference.md" : "ai-font-guide.md");
+                }
+                Filter();
+            }
+            catch (Exception e) { Status.Text = e.Message; }
+        }
+        list.SelectionChanged += (_, _) => { if (list.SelectedItem is not Entry entry) return; var data = entry.Data.DeepClone().AsObject(); if (kind.SelectedItem?.ToString() == "表盘") { var configs = Json.Parse(Read("clock-configs.json"))["configurations"] as JsonObject; data["configuration"] = configs?[entry.Data.Str("clockId")]?.DeepClone(); } details.Text = Json.Pretty(data); };
+        kind.SelectionChanged += (_, _) => Load();
+        search.TextChanged += (_, _) => Filter();
+        var top = new StackPanel();
+        top.Children.Add(Row(kind, Note("搜索"), search, Button("模板载入草稿", () => { try { if (list.SelectedItem is not Entry entry || entry.Data["watchface"] is not JsonObject config) throw new FrameException("请选择官方模板。"); if (config["ItemList"] is not JsonArray { Count: > 0 }) throw new FrameException("此项只有背景参考，请使用最小时间模板。"); editor.Text = Json.Pretty(Draft(config)); asset = null; assetLabel.Text = "未选择背景或素材包"; Status.Text = "已载入草稿；请切换本地表盘页检查并选择素材，尚未写入设备。"; } catch (Exception e) { Status.Text = e.Message; } })));
+        top.Children.Add(Row(Note("显示元素 disp"), disp, Button("生成布局建议", () => { try { var id = int.Parse(disp.Text); var row = Json.Parse(Read("disp-catalog.json")).Rows("displays").First(r => r.Int("disp") == id); var tw = row["typography"] as JsonObject ?? throw new FrameException("此元素暂无布局统计。"); var suggested = new JsonObject { ["disp"] = id, ["size"] = tw["size"]?["p50"]?.DeepClone(), ["alig"] = tw["alig"]?["mode"]?.DeepClone() ?? JsonValue.Create(3) }; foreach (var key in new[] { "x", "y", "w", "h" }) suggested[key] = tw["box"]?[key]?["p50"]?.DeepClone(); foreach (var key in new[] { "color_1", "color_2" }) if (tw["colorHints"]?[key + "_common"] is JsonArray { Count: > 0 } colors) suggested[key] = colors[0]?.DeepClone(); details.Text = Json.Pretty(new JsonObject { ["canvas"] = new JsonObject { ["width"] = 800, ["height"] = 1280 }, ["suggestedItemFields"] = suggested, ["说明"] = "取官方样本中位数，应用前限制在画布内并以设备截图核对。" }); } catch (Exception e) { Status.Text = e.Message; } })));
+        DockPanel.SetDock(top, Dock.Top);
+        panel.Children.Add(top);
+        var bottom = Note("DivoomDevelop/mcp-divoom-lan · MIT · TimesFrame 专用参考目录；模板不含图像素材，设备安装情况可能不同。");
+        DockPanel.SetDock(bottom, Dock.Bottom);
+        panel.Children.Add(bottom);
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new()
+        {
+            Width = new GridLength(290)
+        });
+        grid.ColumnDefinitions.Add(new());
+        grid.Children.Add(list);
+        Grid.SetColumn(details, 1);
+        grid.Children.Add(details);
+        panel.Children.Add(grid);
+        Load();
+        Tab("官方素材目录", panel);
+    }
+    void ConsoleTab()
+    {
+        var panel = new DockPanel { Margin = new Thickness(14) };
+        var command = Field("Device/GetHardwareVersion", 440);
+        var fields = Ui.Editor("{}");
+        var top = new StackPanel();
+        top.Children.Add(Note("直接向已连接设备发送 JSON。参数不含 Command 和 ReturnCode；创建与修改表盘请走专用页面。写入命令可能改变或删除设备内容。"));
+        top.Children.Add(Row(command, Button("发送命令…", async () => { if (!Ui.Confirm(this, $"目标 {frame.Ip}:{frame.Port}\n命令 {command.Text}\n确认参数并发送？")) return; await Run("发送高级命令", async ct => { await frame.Identify(ct); var name = command.Text.Trim(); if (name.Length == 0 || name is "Device/CreateLocalClock" or "Device/PatchLocalClockInfo" or "Device/UploadLocalAsset") throw new FrameException("请使用专用页面；AstroToo 独立素材接口不适用于此设备。"); output.Text = Json.Pretty(await frame.Command(name, Json.Parse(fields.Text), ct)); }); })));
+        DockPanel.SetDock(top, Dock.Top);
+        panel.Children.Add(top);
+        panel.Children.Add(fields);
+        Tab("高级命令", panel);
+    }
+    void Save(string text)
+    {
+        var save = new SaveFileDialog { FileName = "TimesFrame-设备数据.json", Filter = "JSON|*.json" };
+        if (save.ShowDialog(this) == true)
+            try
+            {
+                File.WriteAllText(save.FileName, text);
+            }
+            catch (Exception e) { Status.Text = e.Message; }
+    }
 }

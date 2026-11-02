@@ -1,5 +1,5 @@
 <Window x:Class="TimesFrame.Windows.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:local="clr-namespace:TimesFrame.Windows" Title="TimesFrame 相册管理 · Windows x64 · 0.9.0" Width="1280" Height="820" MinWidth="1080" MinHeight="650" WindowStartupLocation="CenterScreen">
- <DockPanel Margin="12">
+ <DockPanel Margin="12" Background="#F7F8FA">
   <WrapPanel x:Name="Toolbar" DockPanel.Dock="Top" Margin="0,0,0,10" VerticalAlignment="Center">
    <TextBlock Text="相框 IP " VerticalAlignment="Center"/><TextBox x:Name="Ip" Width="150"/><TextBlock Text=" 端口 " VerticalAlignment="Center"/><TextBox x:Name="Port" Width="65" Text="9000"/>
    <Button Content="查找设备" Click="Discover_Click"/><ComboBox x:Name="Found" Width="185" SelectionChanged="Found_Changed"/><Button Content="连接" Click="Connect_Click"/><Button Content="核对手机端" Click="Cloud_Click"/>
